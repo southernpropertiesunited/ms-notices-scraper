@@ -1,0 +1,88 @@
+# SPU MS Public Notices Scraper
+# Runs Mon/Wed/Fri at 6AM Central (11:00 UTC)
+# Also runs on manual trigger
+
+name: MS Foreclosure Scrape
+
+on:
+  schedule:
+      # 6:00 AM Central = 11:00 UTC (CDT) or 12:00 UTC (CST)
+          # Using 11:00 UTC for CDT (summer). Adjust to 12:00 for CST (winter).
+              - cron: '0 11 * * 1,3,5'
+
+                # Manual trigger from GitHub Actions UI
+                  workflow_dispatch:
+
+                  jobs:
+                    scrape:
+                        runs-on: ubuntu-latest
+                            timeout-minutes: 30
+
+                                steps:
+                                      - name: Checkout repo
+                                              uses: actions/checkout@v4
+
+                                                    - name: Set up Python
+                                                            uses: actions/setup-python@v5
+                                                                    with:
+                                                                              python-version: '3.12'
+
+                                                                                    - name: Install dependencies
+                                                                                            run: pip install -r requirements.txt
+
+                                                                                                  - name: Run scraper
+                                                                                                          env:
+                                                                                                                    GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+                                                                                                                              NOTIFY_EMAIL: ${{ secrets.NOTIFY_EMAIL }}
+                                                                                                                                        SMTP_USER: ${{ secrets.SMTP_USER }}
+                                                                                                                                                  SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+                                                                                                                                                            SMTP_HOST: ${{ secrets.SMTP_HOST }}
+                                                                                                                                                                      SMTP_PORT: ${{ secrets.SMTP_PORT }}
+                                                                                                                                                                              run: python scraper.py
+                                                                                                                                                                              
+                                                                                                                                                                                    - name: Upload logs on failure
+                                                                                                                                                                                            if: failure()
+                                                                                                                                                                                                    uses: actions/upload-artifact@v4
+                                                                                                                                                                                                            with:
+                                                                                                                                                                                                                      name: scrape-logs
+                                                                                                                                                                                                                                path: "*.log"
+                                                                                                                                                                                                                                          retention-days: 7# SPU MS Public Notices Scraper
+# Runs Mon/Wed/Fri at 6AM Central (11:00 UTC)
+# Also runs on manual trigger
+
+name: MS Foreclosure Scrape
+
+on:
+  schedule:
+    - cron: '0 11 * * 1,3,5'
+  workflow_dispatch:
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Run scraper
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          NOTIFY_EMAIL: ${{ secrets.NOTIFY_EMAIL }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+        run: python scraper.py
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scrape-logs
+          path: "*.log"
+          retention-days: 7
