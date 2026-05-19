@@ -11,7 +11,7 @@ Runs via GitHub Actions on Mon/Wed/Fri at 6AM CT — zero AI charges.
 SETUP (one-time):
 1. Create a Google Cloud project at https://console.cloud.google.com
 2. Enable Google Sheets API + Google Drive API
-3. Create a Service Account, download JSON key
+3. Create a Service Account, download JSON keyh
 4. Share your Google Sheet with the service account email (Editor access)
 5. In your GitHub repo Settings > Secrets, add:
    - GOOGLE_SERVICE_ACCOUNT_JSON  (paste entire JSON key contents)
@@ -40,7 +40,7 @@ from email.mime.multipart import MIMEMultipart
 # ============================================================
 
 COUNTIES = ["George", "Hancock", "Harrison", "Hinds", "Jackson", "Rankin", "Stone"]
-SHEET_ID = "1QOZXHBHK1w8AoX6fFL4pWwO6v46HgFBh"
+SHEET_ID = "1cgGpocIQBdP_39tuI3Pqy4xJud7vZ2yCrHr4_PBH0Ro"
 BASE_URL = "https://www.mspublicnotices.org"
 SEARCH_URL = f"{BASE_URL}/Search.aspx"
 
