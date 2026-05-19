@@ -6,12 +6,12 @@ Scrapes foreclosure notices from mspublicnotices.org for target MS counties.
 Parses borrower info, DOT dates, attorneys, auction details.
 Pushes new entries to Google Sheet, skips duplicates.
 
-Runs via GitHub Actions on Mon/Wed/Fri at 6AM CT — zero AI charges.
+Runs via GitHub Actions on Mon/Wed/Fri at 6AM CT â zero AI charges.
 
 SETUP (one-time):
 1. Create a Google Cloud project at https://console.cloud.google.com
 2. Enable Google Sheets API + Google Drive API
-3. Create a Service Account, download JSON keyh
+3. Create a Service Account, download JSON key
 4. Share your Google Sheet with the service account email (Editor access)
 5. In your GitHub repo Settings > Secrets, add:
    - GOOGLE_SERVICE_ACCOUNT_JSON  (paste entire JSON key contents)
@@ -43,6 +43,13 @@ COUNTIES = ["George", "Hancock", "Harrison", "Hinds", "Jackson", "Rankin", "Ston
 SHEET_ID = "1cgGpocIQBdP_39tuI3Pqy4xJud7vZ2yCrHr4_PBH0Ro"
 BASE_URL = "https://www.mspublicnotices.org"
 SEARCH_URL = f"{BASE_URL}/Search.aspx"
+
+# County checkbox indices on the redesigned mspublicnotices.org form
+# Each county has a checkbox: ctl00$ContentPlaceHolder1$as1$lstCounty$N
+COUNTY_INDICES = {
+    "George": 19, "Hancock": 22, "Harrison": 23,
+    "Hinds": 24, "Jackson": 29, "Rankin": 60, "Stone": 65,
+}
 
 # Google Sheets scopes
 SCOPES = [
@@ -91,78 +98,142 @@ class MSNoticesScraper:
         self.session.headers.update({
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
         })
+        self.session_url = None  # Set after first GET (cookieless session)
 
-    def get_viewstate(self, html):
-        """Extract ASP.NET ViewState fields from page HTML."""
+    def get_hidden_fields(self, html):
+        """Extract ALL hidden input fields from page HTML."""
         soup = BeautifulSoup(html, "lxml")
         fields = {}
-        for name in ["__VIEWSTATE", "__VIEWSTATEGENERATOR", "__EVENTVALIDATION"]:
-            tag = soup.find("input", {"name": name})
-            if tag:
-                fields[name] = tag.get("value", "")
+        for inp in soup.find_all("input", {"type": "hidden"}):
+            name = inp.get("name", "")
+            if name:
+                fields[name] = inp.get("value", "")
         return fields
 
-    def search_county(self, county, notice_type="Foreclosure"):
+    def _build_base_form(self, hidden, keywords="", search_type="AND"):
+        """Build the base form data dict with common fields."""
+        form = dict(hidden)
+        form["__LASTFOCUS"] = ""
+        form["ctl00$ContentPlaceHolder1$as1$txtSearch"] = keywords
+        form["ctl00$ContentPlaceHolder1$as1$rdoType"] = search_type
+        form["ctl00$ContentPlaceHolder1$as1$txtExclude"] = ""
+        form["ctl00$ContentPlaceHolder1$as1$hdnLastScrollPos"] = "0"
+        form["ctl00$ContentPlaceHolder1$as1$hdnCountyScrollPosition"] = "-1"
+        form["ctl00$ContentPlaceHolder1$as1$hdnCityScrollPosition"] = "-1"
+        form["ctl00$ContentPlaceHolder1$as1$hdnPubScrollPosition"] = "-1"
+        form["ctl00$ContentPlaceHolder1$as1$hdnField"] = ""
+        form["ctl00$ContentPlaceHolder1$as1$dateRange"] = "rbLastNumDays"
+        form["ctl00$ContentPlaceHolder1$as1$txtLastNumDays"] = "60"
+        form["ctl00$ContentPlaceHolder1$as1$txtLastNumWeeks"] = "52"
+        form["ctl00$ContentPlaceHolder1$as1$txtLastNumMonths"] = "12"
+        return form
+
+    def search_county(self, county):
         """
-        Search for notices in a given county.
-        Returns list of dicts: {id, title, url, pub_date}
+        Search for foreclosure notices in a given county.
+        Uses 3-step ASP.NET postback:
+          1) Select "Foreclosure" from Popular Searches dropdown
+          2) Check the county checkbox (triggers postback)
+          3) Click search button (btnGo)
+        Returns list of dicts: {id, title, url, county}
         """
         results = []
+        county_idx = COUNTY_INDICES.get(county)
+        if county_idx is None:
+            print(f"  ERROR: Unknown county '{county}'")
+            return results
 
-        # Step 1: GET search page to grab ViewState
+        cb_name = f"ctl00$ContentPlaceHolder1$as1$lstCounty${county_idx}"
+
+        # --- Step 1: GET search page (follows redirect to session URL) ---
         try:
             resp = self.session.get(SEARCH_URL, timeout=30)
             resp.raise_for_status()
+            self.session_url = resp.url  # e.g. /(S(xxx))/Search.aspx
         except Exception as e:
             print(f"  ERROR fetching search page: {e}")
             return results
 
-        vs = self.get_viewstate(resp.text)
+        hidden = self.get_hidden_fields(resp.text)
         time.sleep(RATE_LIMIT)
 
-        # Step 2: POST search form with county + type filters
-        form_data = {
-            **vs,
-            "ctl00$ContentPlaceHolder1$as1$txtSearch": "",
-            "ctl00$ContentPlaceHolder1$as1$ddlCounty": county,
-            "ctl00$ContentPlaceHolder1$as1$ddlNoticeType": notice_type,
-            "ctl00$ContentPlaceHolder1$as1$btnSearch": "Search",
-        }
+        # --- Step 2: POST â Select "Foreclosure" from Popular Searches ---
+        form = self._build_base_form(hidden)
+        form["__EVENTTARGET"] = "ctl00$ContentPlaceHolder1$as1$ddlPopularSearches"
+        form["__EVENTARGUMENT"] = ""
+        form["ctl00$ContentPlaceHolder1$as1$ddlPopularSearches"] = "6"
 
         try:
-            resp = self.session.post(SEARCH_URL, data=form_data, timeout=30)
+            resp = self.session.post(self.session_url, data=form, timeout=30)
             resp.raise_for_status()
         except Exception as e:
-            print(f"  ERROR posting search for {county}: {e}")
+            print(f"  ERROR selecting Foreclosure: {e}")
             return results
 
-        # Step 3: Parse results from all pages
+        time.sleep(RATE_LIMIT)
+
+        # --- Step 3: POST â Check county checkbox (postback) ---
+        hidden2 = self.get_hidden_fields(resp.text)
+        form2 = self._build_base_form(hidden2, keywords="foreclosure real+estate", search_type="OR")
+        form2["__EVENTTARGET"] = cb_name
+        form2["__EVENTARGUMENT"] = ""
+        form2["ctl00$ContentPlaceHolder1$as1$ddlPopularSearches"] = "0"
+        form2[cb_name] = "on"
+
+        try:
+            resp = self.session.post(self.session_url, data=form2, timeout=30)
+            resp.raise_for_status()
+        except Exception as e:
+            print(f"  ERROR checking county {county}: {e}")
+            return results
+
+        time.sleep(RATE_LIMIT)
+
+        # --- Step 4: POST â Click search button (btnGo) ---
+        hidden3 = self.get_hidden_fields(resp.text)
+        form3 = self._build_base_form(hidden3, keywords="foreclosure real+estate", search_type="OR")
+        form3["__EVENTTARGET"] = ""
+        form3["__EVENTARGUMENT"] = ""
+        form3["ctl00$ContentPlaceHolder1$as1$ddlPopularSearches"] = "0"
+        form3[cb_name] = "on"
+        form3["ctl00$ContentPlaceHolder1$as1$btnGo"] = ""
+
+        try:
+            resp = self.session.post(self.session_url, data=form3, timeout=30)
+            resp.raise_for_status()
+        except Exception as e:
+            print(f"  ERROR searching {county}: {e}")
+            return results
+
+        # --- Step 5: Parse results from all pages ---
         page_num = 1
         while True:
             print(f"    Page {page_num}...")
             soup = BeautifulSoup(resp.text, "lxml")
-            page_results = self._parse_search_results(soup)
+            page_results = self._parse_search_results(soup, county)
 
             if not page_results:
                 break
 
             results.extend(page_results)
 
-            # Check for next page link
-            next_link = self._find_next_page(soup)
-            if not next_link:
+            # Check for next page button
+            next_btn = self._find_next_page_btn(soup)
+            if not next_btn:
                 break
 
             # Navigate to next page
             time.sleep(RATE_LIMIT)
-            vs = self.get_viewstate(resp.text)
-            form_data = {
-                **vs,
-                "__EVENTTARGET": next_link,
-                "__EVENTARGUMENT": "",
-            }
+            hidden_pg = self.get_hidden_fields(resp.text)
+            form_pg = self._build_base_form(hidden_pg, keywords="foreclosure real+estate", search_type="OR")
+            form_pg["__EVENTTARGET"] = ""
+            form_pg["__EVENTARGUMENT"] = ""
+            form_pg["ctl00$ContentPlaceHolder1$as1$ddlPopularSearches"] = "0"
+            form_pg[cb_name] = "on"
+            form_pg[next_btn] = ""  # click next page image button
+
             try:
-                resp = self.session.post(SEARCH_URL, data=form_data, timeout=30)
+                resp = self.session.post(self.session_url, data=form_pg, timeout=30)
                 resp.raise_for_status()
             except Exception as e:
                 print(f"  ERROR fetching page {page_num + 1}: {e}")
@@ -172,215 +243,120 @@ class MSNoticesScraper:
 
         return results
 
-    def _parse_search_results(self, soup):
-        """Parse notice listings from search results page."""
+    def _parse_search_results(self, soup, county):
+        """
+        Parse notice listings from search results GridView.
+        Extracts borrower name and DOT date from the snippet text
+        shown in the sibling TR row (detail pages are CAPTCHA-protected).
+        """
         results = []
+        seen_ids = set()
 
-        # Look for result links — format: Details.aspx?ID=XXXXXX
-        links = soup.find_all("a", href=re.compile(r"Details\.aspx\?ID=\d+"))
-        for link in links:
-            href = link.get("href", "")
-            match = re.search(r"ID=(\d+)", href)
-            if not match:
+        # Find all hdnPKValue hidden fields â each holds a notice ID
+        pk_fields = soup.find_all("input", {"name": re.compile(r"hdnPKValue")})
+        for pk in pk_fields:
+            notice_id = pk.get("value", "").strip()
+            if not notice_id or notice_id in seen_ids:
                 continue
+            seen_ids.add(notice_id)
 
-            notice_id = match.group(1)
-            title = link.get_text(strip=True)
+            # Get the parent row â has publication name, date, city, county
+            row = pk.find_parent("tr")
+            row_text = row.get_text(separator=" ", strip=True) if row else ""
+            county_match = re.search(r"County:\s*(\w+)", row_text)
+            row_county = county_match.group(1) if county_match else ""
+            city_match = re.search(r"City:\s*([\w\s'-]+?)(?:\s+County:|\s*$)", row_text)
+            city = city_match.group(1).strip() if city_match else ""
+
+            # Extract publication name and date from row
+            pub_match = re.search(r"^(\S[\w\s&'-]+?)(?:\s*\||\s+\w+day,)", row_text)
+            publication = pub_match.group(1).strip() if pub_match else ""
+            date_match = re.search(
+                r"(\w+day,\s+\w+\s+\d{1,2},\s+\d{4})", row_text
+            )
+            pub_date = date_match.group(1).strip() if date_match else ""
+
             url = f"{BASE_URL}/Details.aspx?ID={notice_id}"
+
+            # Get the snippet text from the next sibling TR row
+            # (contains truncated notice text with borrower name + DOT date)
+            snippet = ""
+            if row:
+                sibling_tr = row.find_next_sibling("tr")
+                if sibling_tr:
+                    snippet = sibling_tr.get_text(separator=" ", strip=True)
+                    # Remove "click 'view' to open the full text." suffix
+                    snippet = re.sub(
+                        r"\s*click\s+'view'\s+to\s+open\s+the\s+full\s+text\.\s*",
+                        "", snippet, flags=re.IGNORECASE
+                    ).strip()
+
+            # Parse borrower from snippet WHEREAS clause
+            borrower = ""
+            if snippet:
+                borrow_match = re.search(
+                    r"(?:executed|given|made)\s+(?:a\s+certain\s+)?(?:deed of trust|Deed of Trust)"
+                    r"|(?:WHEREAS,?\s+on\s+\w+\s+\d{1,2},?\s+\d{4},?\s+)(.+?)(?:,?\s+executed)",
+                    snippet, re.IGNORECASE | re.DOTALL
+                )
+                if not borrow_match or not borrow_match.group(1):
+                    # Try alternate: "on [date], [NAME], executed"
+                    borrow_match2 = re.search(
+                        r"on\s+\w+\s+\d{1,2},?\s+\d{4},?\s+(.+?),?\s+executed",
+                        snippet, re.IGNORECASE
+                    )
+                    if borrow_match2:
+                        borrower = borrow_match2.group(1).strip()
+                else:
+                    borrower = borrow_match.group(1).strip() if borrow_match.group(1) else ""
+                # Clean up borrower name
+                borrower = re.sub(r"\s+", " ", borrower).strip(" ,")
+
+            # Parse DOT date from snippet
+            dot_date = ""
+            if snippet:
+                dot_match = re.search(
+                    r"WHEREAS,?\s+on\s+(\w+\s+\d{1,2},?\s+\d{4})",
+                    snippet, re.IGNORECASE
+                )
+                if dot_match:
+                    dot_date = dot_match.group(1).strip()
 
             results.append({
                 "id": notice_id,
-                "title": title,
                 "url": url,
+                "county": row_county or county,
+                "city": city,
+                "borrower": borrower,
+                "dot_date": dot_date,
+                "publication": publication,
+                "pub_dates": pub_date,
+                "snippet": snippet[:500],
+                # Fields we can't get without detail page (CAPTCHA-protected):
+                "filing_info": "",
+                "attorney": "",
+                "auction_date": "",
+                "auction_time": "",
+                "auction_location": "",
+                "legal_desc": "",
             })
 
         return results
 
-    def _find_next_page(self, soup):
-        """Find the EventTarget for the next page link."""
-        # Look for pager controls — typically "Next" or ">" links
-        pager = soup.find("tr", class_="pager") or soup.find("div", class_="pager")
-        if not pager:
-            # Try finding page number links
-            page_links = soup.find_all("a", href=re.compile(r"__doPostBack.*Page"))
-            if page_links:
-                # Get the last link which is typically "Next"
-                for link in page_links:
-                    text = link.get_text(strip=True)
-                    if text in [">", "Next", "..."]:
-                        href = link.get("href", "")
-                        match = re.search(r"__doPostBack\('([^']+)'", href)
-                        if match:
-                            return match.group(1)
-            return None
-
-        # Inside pager, find next page link
-        links = pager.find_all("a")
-        for link in links:
-            text = link.get_text(strip=True)
-            href = link.get("href", "")
-            if text in [">", "Next", "..."]:
-                match = re.search(r"__doPostBack\('([^']+)'", href)
-                if match:
-                    return match.group(1)
-
+    def _find_next_page_btn(self, soup):
+        """Find the name of the Next page image button, if it exists."""
+        # The GridView uses image buttons: btnNext (enabled when not on last page)
+        btn = soup.find("input", {
+            "name": re.compile(r"btnNext$"),
+            "type": "image",
+        })
+        if btn and not btn.get("disabled"):
+            return btn["name"]
         return None
 
-    def get_notice_detail(self, url):
-        """
-        Fetch and parse a single notice detail page.
-        Returns dict with all extracted fields.
-        """
-        time.sleep(RATE_LIMIT)
-
-        try:
-            resp = self.session.get(url, timeout=30)
-            resp.raise_for_status()
-        except Exception as e:
-            print(f"    ERROR fetching {url}: {e}")
-            return None
-
-        soup = BeautifulSoup(resp.text, "lxml")
-        text = soup.get_text(separator="\n")
-
-        detail = {
-            "url": url,
-            "raw_text": text,
-            "borrower": "",
-            "dot_date": "",
-            "filing_info": "",
-            "attorney": "",
-            "auction_date": "",
-            "auction_time": "",
-            "auction_location": "",
-            "legal_desc": "",
-            "pub_dates": "",
-        }
-
-        # --- Parse borrower names ---
-        # Common patterns: "executed by [NAMES]" or "given by [NAMES]" or "made by [NAMES]"
-        borrow_match = re.search(
-            r"(?:executed|given|made)\s+by\s+(.+?)(?:\s*,\s*(?:to|unto|in favor)|\s+to\s+)",
-            text, re.IGNORECASE | re.DOTALL
-        )
-        if borrow_match:
-            borrower = borrow_match.group(1).strip()
-            borrower = re.sub(r"\s+", " ", borrower)  # collapse whitespace
-            detail["borrower"] = borrower
-
-        # --- Parse Deed of Trust date ---
-        dot_match = re.search(
-            r"(?:Deed of Trust|DOT|deed of trust)\s+dated\s+(\w+\s+\d{1,2},?\s+\d{4}|\d{1,2}/\d{1,2}/\d{2,4})",
-            text, re.IGNORECASE
-        )
-        if dot_match:
-            detail["dot_date"] = dot_match.group(1).strip()
-
-        # --- Parse filing info (Book/Page or Instrument#) ---
-        filing_match = re.search(
-            r"(?:recorded\s+in|filed\s+(?:for record\s+)?in|recorded\s+as)\s+(.+?)(?:\.\s|\sin\sthe)",
-            text, re.IGNORECASE
-        )
-        if filing_match:
-            detail["filing_info"] = filing_match.group(1).strip()[:100]
-
-        # Also try Book/Page pattern
-        if not detail["filing_info"]:
-            bp_match = re.search(r"Book\s+(\d+)\s*,?\s*(?:at\s+)?Page\s+(\d+)", text, re.IGNORECASE)
-            if bp_match:
-                detail["filing_info"] = f"Book {bp_match.group(1)}, Page {bp_match.group(2)}"
-
-        # Instrument number pattern
-        if not detail["filing_info"]:
-            inst_match = re.search(r"Instrument\s*#?\s*(\d+)", text, re.IGNORECASE)
-            if inst_match:
-                detail["filing_info"] = f"Instrument# {inst_match.group(1)}"
-
-        # --- Parse foreclosure attorney ---
-        atty_patterns = [
-            r"(?:Substitute\s+Trustee|Trustee)\s*[:\-]?\s*(.+?)(?:\n|,\s*(?:Attorney|PLLC|LLC|P\.?A\.?))",
-            r"(?:Attorney\s+for\s+|Counsel\s+for\s+)(?:Trustee|Mortgagee)\s*[:\-]?\s*(.+?)(?:\n|\d{3})",
-        ]
-        for pattern in atty_patterns:
-            atty_match = re.search(pattern, text, re.IGNORECASE)
-            if atty_match:
-                detail["attorney"] = atty_match.group(1).strip()[:150]
-                break
-
-        # Fallback: look for common MS foreclosure law firms
-        if not detail["attorney"]:
-            firms = [
-                "Shapiro & Ingle", "McCalla Raymer", "Albertelli Law",
-                "Mackie Wolf", "Underwood Law", "Dean Morris",
-                "Sirote & Permutt", "Halliday Watkins", "Wilson & Associates",
-                "Substitute Trustee Services", "Logs Legal Group",
-            ]
-            for firm in firms:
-                if firm.lower() in text.lower():
-                    # Get the full line
-                    for line in text.split("\n"):
-                        if firm.lower() in line.lower():
-                            detail["attorney"] = line.strip()[:150]
-                            break
-                    break
-
-        # --- Parse auction/sale date, time, location ---
-        sale_patterns = [
-            r"(?:sale|sell|sold)\s+(?:to the highest bidder\s+)?(?:on|at)\s+(\w+\s*,?\s*\w+\s+\d{1,2}\s*,?\s+\d{4})",
-            r"(\w+\s+\d{1,2}\s*,?\s+\d{4})\s*,?\s+(?:at\s+)?(\d{1,2}:\d{2}\s*[AaPp]\.?[Mm]\.?)",
-            r"(?:date of sale|sale date)\s*[:\-]?\s*(\w+\s+\d{1,2}\s*,?\s+\d{4})",
-        ]
-        for pattern in sale_patterns:
-            sale_match = re.search(pattern, text, re.IGNORECASE)
-            if sale_match:
-                detail["auction_date"] = sale_match.group(1).strip()
-                if sale_match.lastindex and sale_match.lastindex >= 2:
-                    detail["auction_time"] = sale_match.group(2).strip()
-                break
-
-        # Time pattern if not caught above
-        if not detail["auction_time"]:
-            time_match = re.search(
-                r"(?:at|@)\s+(\d{1,2}:\d{2}\s*(?:[AaPp]\.?[Mm]\.?)?)\s*(?:o'clock)?",
-                text, re.IGNORECASE
-            )
-            if time_match:
-                detail["auction_time"] = time_match.group(1).strip()
-
-        # Location — usually county courthouse
-        loc_patterns = [
-            r"(?:front door|south door|north door|east door|west door|steps)\s+of\s+(?:the\s+)?(.+?)(?:County|courthouse)",
-            r"(Hinds|Rankin|Harrison|Jackson|George|Hancock|Stone)\s+County\s+Courthouse",
-            r"(?:at the|at)\s+(.+?Courthouse.+?)(?:\.|,\s*(?:being|in the))",
-        ]
-        for pattern in loc_patterns:
-            loc_match = re.search(pattern, text, re.IGNORECASE)
-            if loc_match:
-                detail["auction_location"] = loc_match.group(0).strip()[:200]
-                break
-
-        # --- Parse legal description ---
-        legal_patterns = [
-            r"(?:following\s+described\s+(?:property|real property|land|real estate))\s*[:\-]?\s*(.+?)(?:SAID|Said|WITNESS|Witness|This\s+(?:the|sale)|SUBJECT)",
-            r"(?:property\s+described\s+as)\s*[:\-]?\s*(.+?)(?:\.|SAID|Said|subject)",
-        ]
-        for pattern in legal_patterns:
-            legal_match = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
-            if legal_match:
-                desc = legal_match.group(1).strip()
-                desc = re.sub(r"\s+", " ", desc)  # collapse whitespace
-                detail["legal_desc"] = desc[:500]
-                break
-
-        # --- Parse publication dates ---
-        pub_match = re.search(
-            r"(?:Published|Publication|Publish)\s*(?:dates?)?\s*[:\-]?\s*(.+?)(?:\n\n|\Z)",
-            text, re.IGNORECASE
-        )
-        if pub_match:
-            detail["pub_dates"] = pub_match.group(1).strip()[:200]
-
-        return detail
+    # NOTE: get_notice_detail() removed â detail pages are CAPTCHA-protected
+    # as of May 2026. All available data is now extracted from search result
+    # snippets in _parse_search_results().
 
 
 # ============================================================
@@ -472,8 +448,8 @@ class SheetHandler:
         """Update the Summary tab with latest counts."""
         try:
             summary = self.spreadsheet.worksheet("Summary")
-            # Update is county-specific — adjust cell references to match your layout
-            print("  Summary tab update — adjust cell references in code to match your layout")
+            # Update is county-specific â adjust cell references to match your layout
+            print("  Summary tab update â adjust cell references in code to match your layout")
         except Exception as e:
             print(f"  WARNING: Could not update Summary tab: {e}")
 
@@ -491,13 +467,13 @@ def send_email_report(new_notices, errors):
     smtp_port = int(os.environ.get("SMTP_PORT", "587"))
 
     if not all([email_to, smtp_user, smtp_pass]):
-        print("  Email credentials not configured — skipping notification")
+        print("  Email credentials not configured â skipping notification")
         return
 
     today = date.today().strftime("%m/%d/%Y")
     total = sum(len(v) for v in new_notices.values())
 
-    subject = f"SPU Foreclosure Scrape — {today} — {total} new notices"
+    subject = f"SPU Foreclosure Scrape â {today} â {total} new notices"
 
     body_lines = [
         f"MS Public Notices Scrape Report",
@@ -545,7 +521,7 @@ def send_email_report(new_notices, errors):
 # ============================================================
 
 def run_pipeline():
-    """Main entry point — scrape all counties, update sheet, send report."""
+    """Main entry point â scrape all counties, update sheet, send report."""
     print(f"{'=' * 60}")
     print(f"SPU MS Public Notices Scraper")
     print(f"Run: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -582,7 +558,7 @@ def run_pipeline():
         try:
             listings = scraper.search_county(county)
         except Exception as e:
-            msg = f"{county}: search failed — {e}"
+            msg = f"{county}: search failed â {e}"
             print(f"  ERROR: {msg}")
             errors.append(msg)
             continue
@@ -600,25 +576,18 @@ def run_pipeline():
             new_notices[county] = []
             continue
 
-        # Fetch detail pages for new notices
+        # Write new notices to sheet
+        # Note: Detail pages are CAPTCHA-protected as of May 2026.
+        # Borrower + DOT date are parsed from search result snippets.
+        # Detail URL is stored so notices can be reviewed manually.
         county_new = []
         for i, listing in enumerate(new_listings):
-            print(f"  [{i+1}/{len(new_listings)}] Fetching {listing['id']}...")
+            print(f"  [{i+1}/{len(new_listings)}] {listing.get('borrower', 'Unknown')[:50]}")
 
-            detail = scraper.get_notice_detail(listing["url"])
-            if not detail:
-                errors.append(f"{county}: failed to fetch notice {listing['id']}")
-                continue
-
-            # If borrower wasn't parsed from detail, use listing title
-            if not detail["borrower"] and listing.get("title"):
-                detail["borrower"] = listing["title"]
-
-            # Write to sheet
-            success = sheets.append_notice(ws, detail, county)
+            # Write to sheet (data already extracted from search results)
+            success = sheets.append_notice(ws, listing, county)
             if success:
-                county_new.append(detail)
-                print(f"    Added: {detail['borrower'][:50]}")
+                county_new.append(listing)
             else:
                 errors.append(f"{county}: failed to write {listing['id']}")
 
@@ -631,7 +600,7 @@ def run_pipeline():
     # Summary
     total_new = sum(len(v) for v in new_notices.values())
     print(f"\n{'=' * 60}")
-    print(f"COMPLETE — {total_new} new notices added")
+    print(f"COMPLETE â {total_new} new notices added")
     for county in COUNTIES:
         count = len(new_notices.get(county, []))
         if count:
