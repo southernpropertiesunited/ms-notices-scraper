@@ -6,7 +6,7 @@ Scrapes foreclosure notices from mspublicnotices.org for target MS counties.
 Parses borrower info, DOT dates, attorneys, auction details.
 Pushes new entries to Google Sheet, skips duplicates.
 
-Runs via GitHub Actions on Mon/Wed/Fri at 6AM CT â zero AI charges.
+Runs via GitHub Actions on Mon/Wed/Fri at 6AM CT -- zero AI charges.
 
 SETUP (one-time):
 1. Create a Google Cloud project at https://console.cloud.google.com
@@ -16,6 +16,7 @@ SETUP (one-time):
 5. In your GitHub repo Settings > Secrets, add:
    - GOOGLE_SERVICE_ACCOUNT_JSON  (paste entire JSON key contents)
    - NOTIFY_EMAIL                 (paul@southernpropertiesunited.com)
+   - SMTP_USER                    (Gmail address for sending email)
    - SMTP_PASSWORD                (app password for sending email)
 6. Push this repo and the workflow runs automatically.
 """
@@ -85,6 +86,8 @@ FIRST_DATA_ROW = 7  # Row 7 is first data row (rows 1-6 are headers)
 # Rate limit: seconds between HTTP requests
 RATE_LIMIT = 1.5
 
+# Maximum pages to paginate per county (prevents runaway loops)
+MAX_PAGES = 20
 
 # ============================================================
 # SCRAPER
@@ -157,7 +160,7 @@ class MSNoticesScraper:
         hidden = self.get_hidden_fields(resp.text)
         time.sleep(RATE_LIMIT)
 
-        # --- Step 2: POST â Select "Foreclosure" from Popular Searches ---
+        # --- Step 2: POST -- Select "Foreclosure" from Popular Searches ---
         form = self._build_base_form(hidden)
         form["__EVENTTARGET"] = "ctl00$ContentPlaceHolder1$as1$ddlPopularSearches"
         form["__EVENTARGUMENT"] = ""
@@ -172,7 +175,7 @@ class MSNoticesScraper:
 
         time.sleep(RATE_LIMIT)
 
-        # --- Step 3: POST â Check county checkbox (postback) ---
+        # --- Step 3: POST -- Check county checkbox (postback) ---
         hidden2 = self.get_hidden_fields(resp.text)
         form2 = self._build_base_form(hidden2, keywords="foreclosure real+estate", search_type="OR")
         form2["__EVENTTARGET"] = cb_name
@@ -189,7 +192,7 @@ class MSNoticesScraper:
 
         time.sleep(RATE_LIMIT)
 
-        # --- Step 4: POST â Click search button (btnGo) ---
+        # --- Step 4: POST -- Click search button (btnGo) ---
         hidden3 = self.get_hidden_fields(resp.text)
         form3 = self._build_base_form(hidden3, keywords="foreclosure real+estate", search_type="OR")
         form3["__EVENTTARGET"] = ""
@@ -205,9 +208,9 @@ class MSNoticesScraper:
             print(f"  ERROR searching {county}: {e}")
             return results
 
-        # --- Step 5: Parse results from all pages ---
+        # --- Step 5: Parse results from all pages (capped at MAX_PAGES) ---
         page_num = 1
-        while True:
+        while page_num <= MAX_PAGES:
             print(f"    Page {page_num}...")
             soup = BeautifulSoup(resp.text, "lxml")
             page_results = self._parse_search_results(soup, county)
@@ -236,10 +239,13 @@ class MSNoticesScraper:
                 resp = self.session.post(self.session_url, data=form_pg, timeout=30)
                 resp.raise_for_status()
             except Exception as e:
-                print(f"  ERROR fetching page {page_num + 1}: {e}")
+                print(f"    ERROR fetching page {page_num + 1}: {e}")
                 break
 
             page_num += 1
+
+        if page_num > MAX_PAGES:
+            print(f"    WARNING: Hit MAX_PAGES cap ({MAX_PAGES}) for {county}")
 
         return results
 
@@ -252,7 +258,7 @@ class MSNoticesScraper:
         results = []
         seen_ids = set()
 
-        # Find all hdnPKValue hidden fields â each holds a notice ID
+        # Find all hdnPKValue hidden fields -- each holds a notice ID
         pk_fields = soup.find_all("input", {"name": re.compile(r"hdnPKValue")})
         for pk in pk_fields:
             notice_id = pk.get("value", "").strip()
@@ -260,7 +266,7 @@ class MSNoticesScraper:
                 continue
             seen_ids.add(notice_id)
 
-            # Get the parent row â has publication name, date, city, county
+            # Get the parent row -- has publication name, date, city, county
             row = pk.find_parent("tr")
             row_text = row.get_text(separator=" ", strip=True) if row else ""
             county_match = re.search(r"County:\s*(\w+)", row_text)
@@ -287,7 +293,7 @@ class MSNoticesScraper:
                     snippet = sibling_tr.get_text(separator=" ", strip=True)
                     # Remove "click 'view' to open the full text." suffix
                     snippet = re.sub(
-                        r"\s*click\s+'view'\s+to\s+open\s+the\s+full\s+text\.\s*",
+                        r"\s*click\s*'view'\s+to\s+open\s+the\s+full\s+text\.\s*",
                         "", snippet, flags=re.IGNORECASE
                     ).strip()
 
@@ -295,7 +301,7 @@ class MSNoticesScraper:
             borrower = ""
             if snippet:
                 borrow_match = re.search(
-                    r"(?:executed|given|made)\s+(?:a\s+certain\s+)?(?:deed of trust|Deed of Trust)"
+                    r"(?:executed|given|made)\s+(?:a\s+certin\s+)?(?:deed of trust|Deed of Trust)"
                     r"|(?:WHEREAS,?\s+on\s+\w+\s+\d{1,2},?\s+\d{4},?\s+)(.+?)(?:,?\s+executed)",
                     snippet, re.IGNORECASE | re.DOTALL
                 )
@@ -354,10 +360,9 @@ class MSNoticesScraper:
             return btn["name"]
         return None
 
-    # NOTE: get_notice_detail() removed â detail pages are CAPTCHA-protected
+    # NOTE: get_notice_detail() removed -- detail pages are CAPTCHA-protected
     # as of May 2026. All available data is now extracted from search result
     # snippets in _parse_search_results().
-
 
 # ============================================================
 # GOOGLE SHEETS HANDLER
@@ -438,7 +443,7 @@ class SheetHandler:
         row_data[COL["notice_url"] - 1] = notice.get("url", "")
 
         try:
-            ws.update(f"A{next_row}:S{next_row}", [row_data], value_input_option="USER_ENTERED")
+            ws.update(values=[row_data], range_name=f"A{next_row}:S{next_row}", value_input_option="USER_ENTERED")
             return True
         except Exception as e:
             print(f"    ERROR writing row {next_row}: {e}")
@@ -448,11 +453,10 @@ class SheetHandler:
         """Update the Summary tab with latest counts."""
         try:
             summary = self.spreadsheet.worksheet("Summary")
-            # Update is county-specific â adjust cell references to match your layout
-            print("  Summary tab update â adjust cell references in code to match your layout")
+            # Update is county-specific -- adjust cell references to match your layout
+            print("  Summary tab update -- adjust cell references in code to match your layout")
         except Exception as e:
             print(f"  WARNING: Could not update Summary tab: {e}")
-
 
 # ============================================================
 # EMAIL NOTIFICATION
@@ -467,13 +471,13 @@ def send_email_report(new_notices, errors):
     smtp_port = int(os.environ.get("SMTP_PORT", "587"))
 
     if not all([email_to, smtp_user, smtp_pass]):
-        print("  Email credentials not configured â skipping notification")
+        print("  Email credentials not configured -- skipping notification")
         return
 
     today = date.today().strftime("%m/%d/%Y")
     total = sum(len(v) for v in new_notices.values())
 
-    subject = f"SPU Foreclosure Scrape â {today} â {total} new notices"
+    subject = f"SPU Foreclosure Scrape -- {today} -- {total} new notices"
 
     body_lines = [
         f"MS Public Notices Scrape Report",
@@ -511,17 +515,16 @@ def send_email_report(new_notices, errors):
             server.starttls()
             server.login(smtp_user, smtp_pass)
             server.send_message(msg)
-        print(f"  Email sent to {email_to}")
+            print(f"  Email sent to {email_to}")
     except Exception as e:
         print(f"  ERROR sending email: {e}")
-
 
 # ============================================================
 # MAIN PIPELINE
 # ============================================================
 
 def run_pipeline():
-    """Main entry point â scrape all counties, update sheet, send report."""
+    """Main entry point -- scrape all counties, update sheet, send report."""
     print(f"{'=' * 60}")
     print(f"SPU MS Public Notices Scraper")
     print(f"Run: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -558,7 +561,7 @@ def run_pipeline():
         try:
             listings = scraper.search_county(county)
         except Exception as e:
-            msg = f"{county}: search failed â {e}"
+            msg = f"{county}: search failed -- {e}"
             print(f"  ERROR: {msg}")
             errors.append(msg)
             continue
@@ -582,7 +585,7 @@ def run_pipeline():
         # Detail URL is stored so notices can be reviewed manually.
         county_new = []
         for i, listing in enumerate(new_listings):
-            print(f"  [{i+1}/{len(new_listings)}] {listing.get('borrower', 'Unknown')[:50]}")
+            print(f"    [{i+1}/{len(new_listings)}] {listing.get('borrower', 'Unknown')[:50]}")
 
             # Write to sheet (data already extracted from search results)
             success = sheets.append_notice(ws, listing, county)
@@ -600,7 +603,7 @@ def run_pipeline():
     # Summary
     total_new = sum(len(v) for v in new_notices.values())
     print(f"\n{'=' * 60}")
-    print(f"COMPLETE â {total_new} new notices added")
+    print(f"COMPLETE -- {total_new} new notices added")
     for county in COUNTIES:
         count = len(new_notices.get(county, []))
         if count:
@@ -617,7 +620,6 @@ def run_pipeline():
     # Exit with error code if there were critical failures
     if errors and total_new == 0:
         sys.exit(1)
-
 
 if __name__ == "__main__":
     run_pipeline()
