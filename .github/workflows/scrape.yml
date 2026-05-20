@@ -28,11 +28,19 @@ jobs:
           python-version: '3.12'
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          pip install -r requirements.txt || true
+          pip install playwright requests gspread google-oauth2-service-account
+
+      - name: Install Playwright Chromium Browser
+        run: |
+          playwright install chromium --with-deps
 
       - name: Run scraper
         env:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          NIMBLE_API_TOKEN: ${{ secrets.NIMBLE_API_TOKEN }}
+          BATCHLEADS_API_KEY: ${{ secrets.BATCHLEADS_API_KEY }}
           NOTIFY_EMAIL: ${{ secrets.NOTIFY_EMAIL }}
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
