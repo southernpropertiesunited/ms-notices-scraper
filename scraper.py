@@ -72,29 +72,20 @@ HEADERS = [
     "Mailing Address", "Property Address", "Parcel ID", "DOT Date",
     "Filing Info", "Attorney/Trustee", "Auction Date", "Auction Time",
     "Auction Location", "Legal Description", "Publication Dates",
-    "Notice URL", "Notice ID", "Assessed Value"
+    "Notice URL", "Notice ID", "Assessed Value",
 ]
 
-FIRST_DATA_ROW = 7
-RATE_LIMIT = 1.5
-MAX_PAGES = 20
+FIRST_DATA_ROW = 7  # Row 6 is headers, data starts at row 7
+MAX_PAGES = 20       # Safety cap per county
+
 
 # ============================================================
-# SNIPPET PARSER — Extracts everything possible from search snippets
+# SNIPPET PARSER — extracts data from search result text
 # ============================================================
 
-def parse_snippet(snippet, notice_id=""):
-    """
-    Aggressively parse a foreclosure notice snippet to extract all
-    available fields. MS foreclosure notices follow a standard format:
-
-    'WHEREAS, on [DOT_DATE], [BORROWER], executed a Deed of Trust to
-    [TRUSTEE]... recorded in [BOOK/INSTRUMENT]... [COUNTY] County...
-    I, [ATTORNEY], the duly appointed Substitute Trustee... will offer
-    for sale... on [AUCTION_DATE], [at/between] [AUCTION_TIME]...
-    at [AUCTION_LOCATION]...'
-    """
-    data = {
+def parse_snippet(text, notice_id=""):
+    """Parse a foreclosure notice snippet to extract structured fields."""
+    result = {
         "borrower": "",
         "dot_date": "",
         "filing_info": "",
@@ -106,157 +97,128 @@ def parse_snippet(snippet, notice_id=""):
         "property_address": "",
     }
 
-    if not snippet:
-        return data
-
-    s = snippet
+    if not text:
+        return result
 
     # --- BORROWER ---
-    # Pattern: "on [date], [BORROWER], executed a Deed of Trust"
-    # Also: "on [date], [BORROWER] executed" (no comma before executed)
-    borrow_patterns = [
-        r"(?:WHEREAS,?\s+)?on\s+\w+\s+\d{1,2},?\s+\d{4},?\s+(.+?),?\s+executed\s+(?:a\s+)?(?:certain\s+)?(?:deed\s+of\s+trust|Deed\s+of\s+Trust)",
-        r"(?:WHEREAS,?\s+)?on\s+\w+\s+\d{1,2},?\s+\d{4},?\s+(.+?)\s+executed\s+(?:a\s+)?(?:deed\s+of\s+trust|Deed\s+of\s+Trust)",
-        r"(?:WHEREAS,?\s+)?on\s+\w+\s+\d{1,2},?\s+\d{4},?\s+(.+?),?\s+(?:did\s+)?(?:execute|made\s+and\s+deliver)",
-        r"(?:that\s+)?(\S.+?)\s+executed\s+(?:a\s+)?(?:certain\s+)?deed\s+of\s+trust",
+    borrower_patterns = [
+        r"(?:default\s+(?:having\s+been\s+)?made\s+(?:in\s+)?(?:the\s+)?(?:terms\s+and\s+)?(?:conditions\s+of\s+)?(?:a\s+)?(?:certain\s+)?(?:deed\s+of\s+trust|mortgage)\s+(?:executed\s+(?:and\s+delivered\s+)?by|made\s+by|from|given\s+by)\s+)([A-Z][A-Za-z\s,.'&-]{2,60}?)(?:\s*,?\s*(?:to|unto|in\s+favor|dated|recorded|filed|a\s+(?:married|single|unmarried)))",
+        r"(?:DEED\s+OF\s+TRUST|MORTGAGE)\s+(?:executed\s+(?:and\s+delivered\s+)?by|made\s+by|from)\s+([A-Z][A-Za-z\s,.'&-]{2,60}?)(?:\s*,?\s*(?:to|unto|in\s+favor|dated|recorded|filed|a\s+(?:married|single|unmarried)))",
+        r"(?:default\s+(?:of|in)\s+(?:the\s+)?payment).*?(?:by|from|executed\s+by)\s+([A-Z][A-Za-z\s,.'&-]{2,60}?)(?:\s*,?\s*(?:to|unto|in\s+favor|dated|recorded|filed))",
+        r"(?:I,?\s+the\s+undersigned\s+)?(?:Substituted\s+)?Trustee.*?(?:sell|convey).*?(?:property\s+of|executed\s+by|made\s+by)\s+([A-Z][A-Za-z\s,.'&-]{2,60}?)(?:\s*[,.])",
     ]
-    for pat in borrow_patterns:
-        m = re.search(pat, s, re.IGNORECASE | re.DOTALL)
-        if m and m.group(1):
-            borrower = m.group(1).strip()
-            borrower = re.sub(r"\s+", " ", borrower).strip(" ,;")
-            # Cap at 80 chars to avoid grabbing too much
-            if len(borrower) <= 80:
-                data["borrower"] = borrower
+    for pat in borrower_patterns:
+        m = re.search(pat, text, re.IGNORECASE | re.DOTALL)
+        if m:
+            borrower = m.group(1).strip().rstrip(",. ")
+            borrower = re.sub(r"\s+", " ", borrower)
+            if len(borrower) > 3 and not re.match(r"^(the|a|an|to|in|for|and|or)$", borrower, re.I):
+                result["borrower"] = borrower
                 break
 
     # --- DOT DATE ---
     dot_patterns = [
-        r"WHEREAS,?\s+on\s+(\w+\s+\d{1,2},?\s+\d{4})",
-        r"on\s+(?:the\s+)?(\d{1,2}(?:st|nd|rd|th)?\s+day\s+of\s+\w+,?\s+\d{4})",
-        r"on\s+(\w+\s+\d{1,2},?\s+\d{4}),?\s+\w",
+        r"(?:deed\s+of\s+trust|mortgage)\s+dated\s+(?:the\s+)?(\w+\s+\d{1,2},?\s+\d{4})",
+        r"(?:deed\s+of\s+trust|mortgage)\s+dated\s+(\d{1,2}/\d{1,2}/\d{4})",
+        r"dated\s+(?:the\s+)?(\w+\s+\d{1,2},?\s+\d{4})\s*,?\s*(?:and\s+)?recorded",
     ]
     for pat in dot_patterns:
-        m = re.search(pat, s, re.IGNORECASE)
+        m = re.search(pat, text, re.IGNORECASE)
         if m:
-            data["dot_date"] = m.group(1).strip()
+            result["dot_date"] = m.group(1).strip()
             break
 
     # --- FILING INFO ---
-    # "recorded in Book XXX, Page YYY" or "Instrument No. XXXX"
     filing_patterns = [
-        r"recorded\s+in\s+(Book\s+\d+[\w\s,]+?Page\s+\d+)",
-        r"recorded\s+(?:at\s+)?(?:in\s+)?(Instrument\s+(?:No\.?\s*)?\d[\d\-]+)",
-        r"(?:Book|Bk\.?)\s+(\d+)\s*,?\s*(?:Page|Pg\.?|at\s+Page)\s+(\d+)",
-        r"(Instrument\s+(?:#|No\.?|Number)?\s*\d[\d\-]+)",
+        r"recorded\s+in\s+(Book\s+\d+[,\s]+(?:Page|at\s+Page)\s+\d+)",
+        r"(?:filed|recorded)\s+(?:for\s+record\s+)?(?:on\s+)?(?:\w+\s+\d{1,2},?\s+\d{4}\s+)?(?:in\s+)?(?:the\s+)?(?:office\s+of\s+)?.*?(Book\s+\d+[,\s]+(?:Page|at\s+Page)\s+\d+)",
+        r"(?:Instrument|Document)\s*(?:No\.?|Number|#)\s*[:\s]*(\d[\d-]+)",
+        r"recorded\s+(?:on\s+)?(\w+\s+\d{1,2},?\s+\d{4})\s+(?:in\s+)?(?:the\s+)?(?:office|land\s+records)",
     ]
     for pat in filing_patterns:
-        m = re.search(pat, s, re.IGNORECASE)
+        m = re.search(pat, text, re.IGNORECASE)
         if m:
-            if m.lastindex and m.lastindex >= 2:
-                data["filing_info"] = f"Book {m.group(1)}, Page {m.group(2)}"
-            else:
-                data["filing_info"] = m.group(1).strip() if m.group(1) else m.group(0).strip()
+            result["filing_info"] = m.group(1).strip()
             break
 
-    # --- ATTORNEY / SUBSTITUTE TRUSTEE ---
-    atty_patterns = [
-        r"(?:I,|undersigned)\s+([A-Z][A-Za-z\s\.,']+?),?\s+(?:the\s+)?(?:duly\s+)?(?:appointed\s+)?Substitute\s+Trustee",
-        r"(?:appointed|named)\s+([A-Z][A-Za-z\s\.,']+?)\s+as\s+(?:the\s+)?Substitute\s+Trustee",
-        r"Substitute\s+Trustee[\s:]+([A-Z][A-Za-z\s\.,']+?)(?:\s*,|\s+will|\s+does)",
-        r"(?:TRUSTEE|Trustee)[\s:,]+([A-Z][A-Za-z\s\.,']{5,50}?)(?:\s*,|\s+\d|\s+will)",
+    # --- ATTORNEY / TRUSTEE ---
+    attorney_patterns = [
+        r"(?:Substituted\s+Trustee|Trustee)[:\s]+([A-Z][A-Za-z\s,.'&-]{2,60}?)(?:\s*,?\s*(?:Attorney|Esq|P\.?A|LLC|PLLC|PC|Mississippi|MS\s+\d|having|will|shall|\d{3}[\s.-]\d{3}))",
+        r"(?:Attorney\s+for\s+(?:the\s+)?(?:Trustee|Mortgagee|Beneficiary)|Prepared\s+by)[:\s]+([A-Z][A-Za-z\s,.'&-]{2,60}?)(?:\s*,?\s*(?:Esq|P\.?A|LLC|PLLC|PC|Mississippi|MS\s+\d|\d{3}[\s.-]\d{3}))",
+        r"(?:MCCALLA\s+RAYMER|ALBERTELLI\s+LAW|SHAPIRO\s+&\s+INGLE|SIROTE\s+&\s+PERMUTT|DEAN\s+MORRIS|UNDERWOOD\s+LAW|HALLIDAY\s+WATKINS)[A-Za-z\s,.'&-]*",
+        r"(\w+\s+(?:Law\s+(?:Firm|Group|Office)|PLLC|LLC|P\.?A\.?))\s*,",
     ]
-    for pat in atty_patterns:
-        m = re.search(pat, s, re.DOTALL)
+    for pat in attorney_patterns:
+        m = re.search(pat, text, re.IGNORECASE)
         if m:
-            atty = m.group(1).strip().strip(",. ")
-            atty = re.sub(r"\s+", " ", atty)
-            if len(atty) <= 60 and len(atty) >= 3:
-                data["attorney"] = atty
-                break
+            result["attorney"] = m.group(0).strip() if pat == attorney_patterns[2] else m.group(1).strip()
+            result["attorney"] = result["attorney"].rstrip(",. ")
+            break
 
-    # --- AUCTION DATE ---
-    # "will sell...on [DATE]" or "sale will be held on [DATE]"
-    # Also: "on the Xth day of Month, Year"
-    auction_patterns = [
-        r"(?:sell|sale|sold)\s+(?:at\s+public\s+(?:outcry|auction|sale)\s+)?.*?on\s+(?:the\s+)?(\w+\s+\d{1,2},?\s+\d{4})",
-        r"(?:sell|sale|sold)\s+.*?on\s+(?:the\s+)?(\d{1,2}(?:st|nd|rd|th)?\s+day\s+of\s+\w+,?\s+\d{4})",
-        r"(?:sale\s+(?:date|will\s+be\s+held))[\s:]+(\w+\s+\d{1,2},?\s+\d{4})",
-        r"(?:on|dated?)\s+(\w+\s+\d{1,2},?\s+\d{4})\s*,?\s*(?:at|between)\s+\d{1,2}:\d{2}",
+    # --- AUCTION DATE --- (must NOT match DOT date)
+    dot_date_str = result.get("dot_date", "").lower()
+    auction_date_patterns = [
+        r"(?:sale|sold|sell|auction|foreclosure\s+sale)\s+(?:will\s+(?:be\s+)?)?(?:held\s+)?(?:on\s+)?(?:the\s+)?(\d{1,2}(?:st|nd|rd|th)?\s+day\s+of\s+\w+,?\s+\d{4})",
+        r"(?:sale|sold|sell|auction|foreclosure\s+sale)\s+(?:will\s+(?:be\s+)?)?(?:held\s+)?(?:on\s+)?(\w+\s+\d{1,2},?\s+\d{4})",
+        r"(?:on|at)\s+(\w+\s+\d{1,2},?\s+\d{4})\s*,?\s*(?:at|between|during|within)\s+(?:the\s+)?(?:legal\s+)?(?:hours|hour|time)",
+        r"(\w+\s+\d{1,2},?\s+\d{4})\s*,?\s*(?:at|between)\s+(?:the\s+)?(?:legal\s+)?(?:hours|hour)",
     ]
-    for pat in auction_patterns:
-        m = re.search(pat, s, re.IGNORECASE | re.DOTALL)
+    for pat in auction_date_patterns:
+        m = re.search(pat, text, re.IGNORECASE)
         if m:
-            auction_str = m.group(1).strip()
-            # Make sure this isn't the DOT date (check it's a different date)
-            if auction_str != data["dot_date"]:
-                data["auction_date"] = auction_str
+            candidate = m.group(1).strip()
+            if candidate.lower() not in dot_date_str and "deed" not in text[max(0, m.start()-30):m.start()].lower():
+                result["auction_date"] = candidate
                 break
-
-    # If we found an auction date in "Xth day of Month, Year" format, normalize it
-    if data["auction_date"]:
-        day_of_match = re.match(r"(\d{1,2})(?:st|nd|rd|th)?\s+day\s+of\s+(\w+),?\s+(\d{4})", data["auction_date"])
-        if day_of_match:
-            data["auction_date"] = f"{day_of_match.group(2)} {day_of_match.group(1)}, {day_of_match.group(3)}"
 
     # --- AUCTION TIME ---
     time_patterns = [
-        r"(?:at|between)\s+(\d{1,2}:\d{2}\s*(?:AM|PM|A\.M\.|P\.M\.|a\.m\.|p\.m\.|o'clock|noon))",
-        r"(?:at|between)\s+(\d{1,2}:\d{2})\s+(?:o'clock\s+)?(?:in\s+the\s+)?(morning|afternoon|noon)",
-        r"(?:at\s+)?(\d{1,2}:\d{2})\s*(?:AM|PM|A\.M\.|P\.M\.)",
-        r"(?:at\s+)?(\d{1,2}\s*(?:AM|PM|A\.M\.|P\.M\.))\b",
+        r"(?:at|between)\s+(?:the\s+)?(?:hour\s+of\s+)?(\d{1,2}:\d{2}\s*(?:a\.?m\.?|p\.?m\.?|o'clock|noon))",
+        r"(?:between\s+the\s+(?:legal\s+)?hours\s+of\s+)(\d{1,2}:\d{2}\s*(?:a\.?m\.?|p\.?m\.?)\s+and\s+\d{1,2}:\d{2}\s*(?:a\.?m\.?|p\.?m\.?))",
+        r"(?:at\s+)?(\d{1,2}:\d{2}\s*(?:a\.?m\.?|p\.?m\.?))\s*(?:,|on|at\s+the)",
+        r"(?:legal\s+hours|during\s+(?:the\s+)?(?:legal\s+)?hours?\s+of\s+sale\s+)(?:between\s+)?(\d{1,2}[:\s]*\d{0,2}\s*(?:a\.?m\.?|p\.?m\.?|o'clock))",
     ]
     for pat in time_patterns:
-        m = re.search(pat, s, re.IGNORECASE)
+        m = re.search(pat, text, re.IGNORECASE)
         if m:
-            time_str = m.group(1).strip()
-            if m.lastindex >= 2 and m.group(2):
-                time_str += " " + m.group(2)
-            data["auction_time"] = time_str.upper().replace(".", "")
+            result["auction_time"] = m.group(1).strip()
             break
 
     # --- AUCTION LOCATION ---
-    loc_patterns = [
-        r"(?:front|south|north|east|west|main)\s+(?:door|steps?|entrance)\s+of\s+(?:the\s+)?(.+?)(?:County\s+Courthouse)(?:\s+(?:in|at|,)\s+([A-Za-z\s]+),?\s*(?:Mississippi|MS))?",
-        r"(?:at\s+the\s+)(.+?County\s+Courthouse.+?)(?:\s+on\s+|\s+at\s+\d|\s*,\s*(?:I|the|said|being))",
-        r"(?:at\s+the\s+)([\w\s]+?Courthouse[\w\s,]*?(?:Mississippi|MS))",
-        r"(?:at\s+the\s+)([\w\s]+?County\s+Courthouse)",
+    location_patterns = [
+        r"(?:front\s+door|courthouse\s+(?:door|steps|building))\s+(?:of\s+(?:the\s+)?)?([A-Za-z\s]+County\s+Courthouse[A-Za-z\s,]*?(?:Mississippi|MS))",
+        r"(?:at\s+the\s+)((?:front\s+door|south\s+door|north\s+door|east\s+door|west\s+door|main\s+entrance)\s+of\s+(?:the\s+)?[A-Za-z\s]+County\s+Courthouse)",
+        r"(?:at\s+the\s+)([A-Za-z\s]+County\s+Courthouse\b[^.]*?(?:Mississippi|MS|in\s+\w+))",
+        r"(?:sale\s+(?:shall|will)\s+be\s+held\s+at\s+)(.+?(?:Courthouse|Building|Office)[^.]{0,60}?)(?:\.|,\s+(?:on|at|between))",
     ]
-    for pat in loc_patterns:
-        m = re.search(pat, s, re.IGNORECASE | re.DOTALL)
+    for pat in location_patterns:
+        m = re.search(pat, text, re.IGNORECASE)
         if m:
-            loc = m.group(0).strip()
-            # Clean up — start from "at the" or the door description
-            loc = re.sub(r"^(?:at\s+the\s+)", "", loc, flags=re.IGNORECASE).strip()
-            loc = re.sub(r"\s+", " ", loc)
-            if len(loc) <= 120:
-                data["auction_location"] = loc
-                break
+            result["auction_location"] = re.sub(r"\s+", " ", m.group(1).strip()).rstrip(",. ")
+            break
 
-    # --- PROPERTY / LEGAL DESCRIPTION ---
+    # --- LEGAL DESCRIPTION ---
     legal_patterns = [
-        r"(?:described\s+as|to[\s-]wit|property[\s:]+)([\s\S]{10,200}?)(?:\s+(?:WHEREAS|NOW|said\s+(?:deed|property|Deed)|I,\s+\w))",
-        r"(Lot\s+\d+[\w\s,]+?(?:Section|Block|Township|Range|Addition|Subdivision)[\w\s,\.]+?)(?:\s+(?:in|of|WHEREAS|NOW|said))",
+        r"(?:(?:the\s+)?following\s+(?:described\s+)?(?:real\s+)?(?:property|land|estate)\s*[:\-]\s*)(.*?)(?:\s*(?:SAID|SUBJECT|WITNESS|I\s+WILL|TERMS|being\s+the\s+same))",
+        r"(?:Lot\s+\d+[A-Za-z\s,.'&\d()-]+(?:Subdivision|Addition|Plat|Section|Township)[A-Za-z\s,.'&\d()-]*?)(?:\.|SAID|SUBJECT)",
     ]
     for pat in legal_patterns:
-        m = re.search(pat, s, re.IGNORECASE | re.DOTALL)
+        m = re.search(pat, text, re.IGNORECASE | re.DOTALL)
         if m:
-            legal = m.group(1).strip().strip(",. ::")
-            legal = re.sub(r"\s+", " ", legal)
-            if len(legal) >= 10 and len(legal) <= 200:
-                data["legal_desc"] = legal
+            legal = m.group(1).strip() if "following" in pat else m.group(0).strip()
+            legal = re.sub(r"\s+", " ", legal).rstrip(",. ")
+            if len(legal) > 10:
+                result["legal_desc"] = legal[:500]
                 break
 
-    return data
+    return result
 
 
 # ============================================================
-# SCRAPER
+# ASP.NET SCRAPER
 # ============================================================
 
 class MSNoticesScraper:
-    """Scrapes mspublicnotices.org for foreclosure notices."""
-
     def __init__(self):
         self.session = requests.Session()
         self.session.headers.update({
@@ -264,122 +226,76 @@ class MSNoticesScraper:
         })
         self.session_url = None
 
-    def get_hidden_fields(self, html):
-        soup = BeautifulSoup(html, "lxml")
-        fields = {}
+    def _init_session(self):
+        """Initialize ASP.NET session — gets cookieless session URL."""
+        resp = self.session.get(SEARCH_URL, timeout=30)
+        resp.raise_for_status()
+        self.session_url = resp.url
+        return BeautifulSoup(resp.text, "html.parser")
+
+    def _get_form_data(self, soup):
+        """Extract all hidden form fields from ASP.NET page."""
+        form = {}
         for inp in soup.find_all("input", {"type": "hidden"}):
             name = inp.get("name", "")
             if name:
-                fields[name] = inp.get("value", "")
-        return fields
-
-    def _build_base_form(self, hidden, keywords="", search_type="AND"):
-        form = dict(hidden)
-        form["__LASTFOCUS"] = ""
-        form["ctl00$ContentPlaceHolder1$as1$txtSearch"] = keywords
-        form["ctl00$ContentPlaceHolder1$as1$rdoType"] = search_type
-        form["ctl00$ContentPlaceHolder1$as1$txtExclude"] = ""
-        form["ctl00$ContentPlaceHolder1$as1$hdnLastScrollPos"] = "0"
-        form["ctl00$ContentPlaceHolder1$as1$hdnCountyScrollPosition"] = "-1"
-        form["ctl00$ContentPlaceHolder1$as1$hdnCityScrollPosition"] = "-1"
-        form["ctl00$ContentPlaceHolder1$as1$hdnPubScrollPosition"] = "-1"
-        form["ctl00$ContentPlaceHolder1$as1$hdnField"] = ""
-        form["ctl00$ContentPlaceHolder1$as1$dateRange"] = "rbLastNumDays"
-        form["ctl00$ContentPlaceHolder1$as1$txtLastNumDays"] = "60"
-        form["ctl00$ContentPlaceHolder1$as1$txtLastNumWeeks"] = "52"
-        form["ctl00$ContentPlaceHolder1$as1$txtLastNumMonths"] = "12"
+                form[name] = inp.get("value", "")
         return form
 
     def search_county(self, county):
-        results = []
-        county_idx = COUNTY_INDICES.get(county)
-        if county_idx is None:
-            print(f"  ERROR: Unknown county '{county}'")
-            return results
+        """Run 3-step ASP.NET postback to get foreclosure listings for a county."""
+        idx = COUNTY_INDICES.get(county)
+        if idx is None:
+            print(f"  WARNING: No index for county {county}")
+            return []
 
-        cb_name = f"ctl00$ContentPlaceHolder1$as1$lstCounty${county_idx}"
+        # Step 1: Init session
+        soup = self._init_session()
+        form = self._get_form_data(soup)
+        print(f"  Session: {self.session_url}")
 
-        # Step 1: GET search page
-        try:
-            resp = self.session.get(SEARCH_URL, timeout=30)
-            resp.raise_for_status()
-            self.session_url = resp.url
-        except Exception as e:
-            print(f"  ERROR fetching search page: {e}")
-            return results
-
-        hidden = self.get_hidden_fields(resp.text)
-        time.sleep(RATE_LIMIT)
-
-        # Step 2: Select Foreclosure
-        form = self._build_base_form(hidden)
+        # Step 2: Select Foreclosure from dropdown
+        form["ctl00$ContentPlaceHolder1$as1$ddlPopularSearches"] = "3"
         form["__EVENTTARGET"] = "ctl00$ContentPlaceHolder1$as1$ddlPopularSearches"
-        form["__EVENTARGUMENT"] = ""
-        form["ctl00$ContentPlaceHolder1$as1$ddlPopularSearches"] = "6"
+        form.pop("ctl00$ContentPlaceHolder1$as1$btnGo", None)
 
         try:
             resp = self.session.post(self.session_url, data=form, timeout=30)
             resp.raise_for_status()
         except Exception as e:
-            print(f"  ERROR selecting Foreclosure: {e}")
-            return results
+            print(f"  ERROR selecting Foreclosure type: {e}")
+            return []
 
-        time.sleep(RATE_LIMIT)
+        soup = BeautifulSoup(resp.text, "html.parser")
+        form = self._get_form_data(soup)
 
-        # Step 3: Check county checkbox
-        hidden2 = self.get_hidden_fields(resp.text)
-        form2 = self._build_base_form(hidden2, keywords="foreclosure real+estate", search_type="OR")
-        form2["__EVENTTARGET"] = cb_name
-        form2["__EVENTARGUMENT"] = ""
-        form2["ctl00$ContentPlaceHolder1$as1$ddlPopularSearches"] = "0"
-        form2[cb_name] = "on"
-
-        try:
-            resp = self.session.post(self.session_url, data=form2, timeout=30)
-            resp.raise_for_status()
-        except Exception as e:
-            print(f"  ERROR checking county {county}: {e}")
-            return results
-
-        time.sleep(RATE_LIMIT)
-
-        # Step 4: Click search
-        hidden3 = self.get_hidden_fields(resp.text)
-        form3 = self._build_base_form(hidden3, keywords="foreclosure real+estate", search_type="OR")
-        form3["__EVENTTARGET"] = ""
-        form3["__EVENTARGUMENT"] = ""
-        form3["ctl00$ContentPlaceHolder1$as1$ddlPopularSearches"] = "0"
-        form3[cb_name] = "on"
-        form3["ctl00$ContentPlaceHolder1$as1$btnGo"] = ""
+        # Step 3: Check county checkbox + click Search
+        cb_name = f"ctl00$ContentPlaceHolder1$as1$cblNewspapers${idx}"
+        form[cb_name] = "on"
+        form["ctl00$ContentPlaceHolder1$as1$ddlPopularSearches"] = "3"
+        form["ctl00$ContentPlaceHolder1$as1$btnGo"] = ""
 
         try:
-            resp = self.session.post(self.session_url, data=form3, timeout=30)
+            resp = self.session.post(self.session_url, data=form, timeout=30)
             resp.raise_for_status()
         except Exception as e:
             print(f"  ERROR searching {county}: {e}")
-            return results
+            return []
 
-        # Step 5: Parse all pages
+        soup = BeautifulSoup(resp.text, "html.parser")
+        results = self._parse_search_results(soup, county)
+        print(f"  Page 1: {len(results)} results")
+
+        # Paginate
         page_num = 1
-        while page_num <= MAX_PAGES:
-            print(f"    Page {page_num}...")
-            soup = BeautifulSoup(resp.text, "lxml")
-            page_results = self._parse_search_results(soup, county)
-
-            if not page_results:
-                break
-
-            results.extend(page_results)
-
+        while page_num < MAX_PAGES:
             next_btn = self._find_next_page_btn(soup)
             if not next_btn:
                 break
 
-            time.sleep(RATE_LIMIT)
-            hidden_pg = self.get_hidden_fields(resp.text)
-            form_pg = self._build_base_form(hidden_pg, keywords="foreclosure real+estate", search_type="OR")
-            form_pg["__EVENTTARGET"] = ""
-            form_pg["__EVENTARGUMENT"] = ""
+            form_pg = self._get_form_data(soup)
+            form_pg[next_btn + ".x"] = "10"
+            form_pg[next_btn + ".y"] = "10"
             form_pg["ctl00$ContentPlaceHolder1$as1$ddlPopularSearches"] = "0"
             form_pg[cb_name] = "on"
             form_pg[next_btn] = ""
@@ -415,7 +331,7 @@ class MSNoticesScraper:
             # Extract county/city from row header
             county_match = re.search(r"County:\s*(\w+)", row_text)
             row_county = county_match.group(1) if county_match else ""
-            city_match = re.search(r"City:\s*([\w\s'-]+?)(?:\s+County:|\s+$)", row_text)
+            city_match = re.search(r"City:\s*([\w\s'-]+?)(?:\s+County:|\s*$)", row_text)
             city = city_match.group(1).strip() if city_match else ""
 
             # Publication info
@@ -677,7 +593,7 @@ class SheetHandler:
             # Also check borrower + county as fallback composite key
             borrower = row[COL["borrower"] - 1].strip() if len(row) >= COL["borrower"] else ""
             county = row[COL["county"] - 1].strip() if len(row) >= COL["county"] else ""
-            composite_key = f"{borrower}|{county}".lower()
+            composite_key = f"{borrower}||{county}".lower()
 
             if notice_id and notice_id in seen_ids:
                 dupes_removed += 1
@@ -744,4 +660,431 @@ class SheetHandler:
         rows_to_keep = []
 
         for i, row in enumerate(all_data):
-     
+            sheet_row = i + 1
+            if sheet_row < FIRST_DATA_ROW:
+                continue
+            if not any(cell.strip() for cell in row):
+                continue
+
+            auction_str = row[COL["auction_date"] - 1].strip() if len(row) >= COL["auction_date"] else ""
+            if not auction_str:
+                rows_to_keep.append(row)
+                continue
+
+            auction_dt = None
+            for fmt in ("%B %d, %Y", "%B %d %Y", "%b %d, %Y", "%m/%d/%Y", "%Y-%m-%d", "%m-%d-%Y"):
+                try:
+                    auction_dt = datetime.strptime(auction_str, fmt).date()
+                    break
+                except ValueError:
+                    continue
+
+            if auction_dt and auction_dt < today:
+                rows_to_archive.append(row[:19])
+            else:
+                rows_to_keep.append(row)
+
+        if not rows_to_archive:
+            return 0
+
+        # Append archived rows to Past Auctions tab
+        past_ws = self.get_or_create_past_auctions_tab()
+        past_all = past_ws.get_all_values()
+        past_next_row = max(len(past_all) + 1, 2)
+
+        end_row = past_next_row + len(rows_to_archive) - 1
+        # Pad rows
+        for i, row in enumerate(rows_to_archive):
+            if len(row) < 19:
+                rows_to_archive[i] = row + [""] * (19 - len(row))
+
+        try:
+            past_ws.update(
+                values=rows_to_archive,
+                range_name=f"A{past_next_row}:S{end_row}",
+                value_input_option="USER_ENTERED"
+            )
+            print(f"  Archived {len(rows_to_archive)} past auctions from {county}")
+        except Exception as e:
+            print(f"  ERROR writing to Past Auctions: {e}")
+            return 0
+
+        # Rewrite county tab with only current rows
+        for i, row in enumerate(rows_to_keep):
+            if len(row) < 19:
+                rows_to_keep[i] = row + [""] * (19 - len(row))
+
+        start = FIRST_DATA_ROW
+        if rows_to_keep:
+            end = start + len(rows_to_keep) - 1
+            try:
+                county_ws.update(
+                    values=rows_to_keep,
+                    range_name=f"A{start}:S{end}",
+                    value_input_option="USER_ENTERED"
+                )
+            except Exception as e:
+                print(f"  ERROR rewriting {county} tab: {e}")
+                return 0
+        else:
+            end = start - 1
+
+        # Clear leftover rows
+        old_total = len(all_data)
+        if end + 1 <= old_total:
+            blank_count = old_total - end
+            if blank_count > 0 and blank_count <= 1000:
+                blank_rows = [[""] * 19] * blank_count
+                try:
+                    county_ws.update(
+                        values=blank_rows,
+                        range_name=f"A{end+1}:S{end+blank_count}",
+                        value_input_option="USER_ENTERED"
+                    )
+                except Exception:
+                    pass
+
+        return len(rows_to_archive)
+
+    # --- SUMMARY TAB ---
+    def update_summary(self, county_counts, run_stats):
+        try:
+            summary = self.spreadsheet.worksheet("Summary")
+        except gspread.exceptions.WorksheetNotFound:
+            summary = self.spreadsheet.add_worksheet(title="Summary", rows=20, cols=10)
+
+        now_str = datetime.now().strftime("%m/%d/%Y %I:%M %p CT")
+
+        rows = []
+        rows.append(["SPU MS PUBLIC NOTICE AI COMMAND CENTER", "", "", "", "", "", "", "", ""])
+        rows.append([f"Last Run: {now_str}", "", "", "", "", "", "", "", ""])
+        rows.append(["", "", "", "", "", "", "", "", ""])
+        rows.append([
+            "County", "Total Active", "New This Run", "Archived This Run",
+            "Errors", "Pages Scraped", "Status", "Run Duration", "Last Updated"
+        ])
+
+        for county in COUNTIES:
+            stats = run_stats.get(county, {})
+            rows.append([
+                county,
+                str(stats.get("total_active", 0)),
+                str(stats.get("new_count", 0)),
+                str(stats.get("archived", 0)),
+                str(stats.get("errors", 0)),
+                str(stats.get("pages", 0)),
+                stats.get("status", "OK"),
+                stats.get("duration", ""),
+                now_str,
+            ])
+
+        rows.append(["", "", "", "", "", "", "", "", ""])
+        total_active = sum(run_stats.get(c, {}).get("total_active", 0) for c in COUNTIES)
+        total_new = sum(run_stats.get(c, {}).get("new_count", 0) for c in COUNTIES)
+        total_archived = sum(run_stats.get(c, {}).get("archived", 0) for c in COUNTIES)
+        rows.append([
+            "TOTAL", str(total_active), str(total_new), str(total_archived),
+            "", "", "", "", ""
+        ])
+
+        try:
+            summary.update(
+                values=rows,
+                range_name=f"A1:I{len(rows)}",
+                value_input_option="USER_ENTERED"
+            )
+            print("  Summary tab updated")
+        except Exception as e:
+            print(f"  ERROR updating Summary: {e}")
+
+    # --- RUN LOG TAB ---
+    def update_run_log(self, run_stats):
+        try:
+            log_ws = self.spreadsheet.worksheet("Run Log")
+        except gspread.exceptions.WorksheetNotFound:
+            log_ws = self.spreadsheet.add_worksheet(title="Run Log", rows=500, cols=12)
+            log_headers = [
+                "Run Timestamp", "Total New", "Total Archived", "Counties Scraped",
+                "George", "Hancock", "Harrison", "Hinds", "Jackson", "Rankin", "Stone", "Errors"
+            ]
+            log_ws.update(values=[log_headers], range_name="A1:L1", value_input_option="USER_ENTERED")
+
+        now_str = datetime.now().strftime("%m/%d/%Y %I:%M:%S %p")
+        total_new = sum(run_stats.get(c, {}).get("new_count", 0) for c in COUNTIES)
+        total_archived = sum(run_stats.get(c, {}).get("archived", 0) for c in COUNTIES)
+        counties_scraped = sum(1 for c in COUNTIES if run_stats.get(c, {}).get("status", "") != "FAILED")
+        errors_list = [run_stats.get(c, {}).get("error_msg", "") for c in COUNTIES if run_stats.get(c, {}).get("error_msg")]
+        errors_str = "; ".join(errors_list) if errors_list else "None"
+
+        row = [now_str, str(total_new), str(total_archived), str(counties_scraped)]
+        for county in COUNTIES:
+            stats = run_stats.get(county, {})
+            row.append(str(stats.get("new_count", 0)))
+        row.append(errors_str)
+
+        try:
+            all_vals = log_ws.col_values(1)
+            next_row = len(all_vals) + 1
+            if next_row < 2:
+                next_row = 2
+        except Exception:
+            next_row = 2
+
+        try:
+            log_ws.update(values=[row], range_name=f"A{next_row}:L{next_row}", value_input_option="USER_ENTERED")
+            print(f"  Run Log updated (row {next_row})")
+        except Exception as e:
+            print(f"  ERROR updating Run Log: {e}")
+
+    # --- RESOURCE SHEET ---
+    def update_resource_sheet(self):
+        try:
+            res_ws = self.spreadsheet.worksheet("Resources")
+        except gspread.exceptions.WorksheetNotFound:
+            res_ws = self.spreadsheet.add_worksheet(title="Resources", rows=30, cols=4)
+
+        rows = [
+            ["SPU MS PUBLIC NOTICE AI COMMAND CENTER — Resources", "", "", ""],
+            ["", "", "", ""],
+            ["RESOURCE", "URL", "PURPOSE", "NOTES"],
+            ["MS Public Notices", "https://www.mspublicnotices.org/Search.aspx", "Primary data source — all MS foreclosure notices", "Search by county, select Foreclosure type"],
+            ["Notice Lookup", "https://www.mspublicnotices.org/Search.aspx", "Look up individual notices by keyword", "Copy borrower name from sheet, paste into search box, select county"],
+            ["George County Assessor", "https://www.deltacomputersystems.com/MS/MS19/index.html", "Property records, parcel IDs, assessed values", "Search by owner name or parcel ID"],
+            ["Hancock County Assessor", "https://www.deltacomputersystems.com/MS/MS24/index.html", "Property records, parcel IDs, assessed values", ""],
+            ["Harrison County Assessor", "https://www.deltacomputersystems.com/MS/MS25/index.html", "Property records, parcel IDs, assessed values", ""],
+            ["Hinds County Assessor", "https://www.deltacomputersystems.com/MS/MS27/index.html", "Property records, parcel IDs, assessed values", ""],
+            ["Jackson County Tax Assessor", "https://www.deltacomputersystems.com/MS/MS30/index.html", "Property records, parcel IDs, assessed values", ""],
+            ["Rankin County Assessor", "https://www.deltacomputersystems.com/MS/MS60/index.html", "Property records, parcel IDs, assessed values", ""],
+            ["Stone County Assessor", "https://www.deltacomputersystems.com/MS/MS67/index.html", "Property records, parcel IDs, assessed values", ""],
+            ["", "", "", ""],
+            ["HOW TO LOOK UP A NOTICE MANUALLY", "", "", ""],
+            ["1. Go to mspublicnotices.org/Search.aspx", "", "", ""],
+            ["2. Select 'Foreclosure' from Popular Searches dropdown", "", "", ""],
+            ["3. Check the county checkbox", "", "", ""],
+            ["4. Paste the borrower name from column B into the search box", "", "", ""],
+            ["5. Click Search — the full notice text will appear", "", "", ""],
+            ["", "", "", ""],
+            ["SKIP TRACING (Phase 2 — Not Yet Implemented)", "", "", ""],
+            ["Skip tracing requires integration with a paid API (TLO, Spokeo, or BeenVerified).", "", "", ""],
+            ["Phone numbers, mailing addresses, and property addresses will auto-populate", "", "", ""],
+            ["once the skip tracing module is built and connected.", "", "", ""],
+        ]
+
+        try:
+            res_ws.update(
+                values=rows,
+                range_name=f"A1:D{len(rows)}",
+                value_input_option="USER_ENTERED"
+            )
+            print("  Resource sheet updated")
+        except Exception as e:
+            print(f"  ERROR updating Resource sheet: {e}")
+
+    # --- UPDATE COUNTY TAB HEADERS ---
+    def update_county_headers(self, ws):
+        try:
+            ws.update(
+                values=[HEADERS],
+                range_name=f"A6:S6",
+                value_input_option="USER_ENTERED"
+            )
+        except Exception as e:
+            print(f"    WARNING: Could not update headers: {e}")
+
+
+# ============================================================
+# EMAIL NOTIFICATION
+# ============================================================
+
+def send_email_report(new_notices, errors, run_stats):
+    email_to = os.environ.get("NOTIFY_EMAIL", "")
+    smtp_user = os.environ.get("SMTP_USER", "")
+    smtp_pass = os.environ.get("SMTP_PASSWORD", "")
+    smtp_host = os.environ.get("SMTP_HOST", "smtp.gmail.com")
+    smtp_port = int(os.environ.get("SMTP_PORT", "587"))
+
+    if not all([email_to, smtp_user, smtp_pass]):
+        print("  Email not configured — skipping")
+        return
+
+    today = date.today().strftime("%m/%d/%Y")
+    total = sum(len(v) for v in new_notices.values())
+    total_archived = sum(run_stats.get(c, {}).get("archived", 0) for c in COUNTIES)
+
+    subject = f"SPU Command Center — {today} — {total} new | {total_archived} archived"
+
+    lines = [
+        "SPU MS PUBLIC NOTICE AI COMMAND CENTER",
+        f"Scrape Report: {today}",
+        f"Total new notices: {total}",
+        f"Total archived (past auctions): {total_archived}",
+        "",
+        "BY COUNTY:",
+        "=" * 50,
+    ]
+
+    for county in COUNTIES:
+        notices = new_notices.get(county, [])
+        stats = run_stats.get(county, {})
+        lines.append(f"\n{county}: {len(notices)} new | {stats.get('archived', 0)} archived | {stats.get('total_active', 0)} active")
+        for n in notices[:10]:
+            borrower = n.get("borrower", "Unknown")
+            auction = n.get("auction_date", "No date")
+            lines.append(f"  - {borrower} | Auction: {auction}")
+        if len(notices) > 10:
+            lines.append(f"  ... and {len(notices) - 10} more")
+
+    if errors:
+        lines.append("\n\nERRORS:")
+        lines.append("=" * 50)
+        for err in errors:
+            lines.append(f"  - {err}")
+
+    lines.append(f"\n\nSheet: https://docs.google.com/spreadsheets/d/{SHEET_ID}")
+
+    body = "\n".join(lines)
+    msg = MIMEMultipart()
+    msg["From"] = smtp_user
+    msg["To"] = email_to
+    msg["Subject"] = subject
+    msg.attach(MIMEText(body, "plain"))
+
+    try:
+        with smtplib.SMTP(smtp_host, smtp_port) as server:
+            server.starttls()
+            server.login(smtp_user, smtp_pass)
+            server.send_message(msg)
+            print(f"  Email sent to {email_to}")
+    except Exception as e:
+        print(f"  ERROR sending email: {e}")
+
+
+# ============================================================
+# MAIN PIPELINE
+# ============================================================
+
+def run_pipeline():
+    print(f"{'=' * 60}")
+    print(f"SPU MS PUBLIC NOTICE AI COMMAND CENTER")
+    print(f"Run: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"{'=' * 60}")
+
+    scraper = MSNoticesScraper()
+    errors = []
+
+    try:
+        sheets = SheetHandler()
+        print("Google Sheets connected.")
+    except Exception as e:
+        print(f"FATAL: Cannot connect to Google Sheets: {e}")
+        traceback.print_exc()
+        sys.exit(1)
+
+    new_notices = {}
+    run_stats = {}
+
+    for county in COUNTIES:
+        print(f"\n--- {county} County ---")
+        county_start = time.time()
+
+        ws = sheets.get_tab(county)
+        if not ws:
+            errors.append(f"{county}: tab not found")
+            run_stats[county] = {"status": "FAILED", "error_msg": "Tab not found"}
+            continue
+
+        sheets.update_county_headers(ws)
+
+        dupes = sheets.dedup_existing_data(ws)
+        if dupes:
+            print(f"  Cleaned {dupes} duplicate entries")
+
+        existing_ids = sheets.get_all_existing_ids(ws)
+        print(f"  Existing unique entries: {len(existing_ids)}")
+
+        try:
+            listings = scraper.search_county(county)
+        except Exception as e:
+            msg = f"{county}: search failed — {e}"
+            print(f"  ERROR: {msg}")
+            errors.append(msg)
+            run_stats[county] = {"status": "FAILED", "error_msg": str(e)}
+            continue
+
+        print(f"  Found {len(listings)} total listings")
+
+        new_listings = [l for l in listings if l["id"] not in existing_ids]
+        print(f"  New (not in sheet): {len(new_listings)}")
+
+        if new_listings:
+            for i, listing in enumerate(new_listings):
+                b = listing.get("borrower", "Unknown")[:40]
+                a = listing.get("auction_date", "No date")
+                print(f"    [{i+1}/{len(new_listings)}] {b} | Auction: {a}")
+
+            county_new = sheets.batch_append_notices(ws, new_listings, county)
+            if not county_new and new_listings:
+                errors.append(f"{county}: batch write failed for {len(new_listings)} notices")
+        else:
+            county_new = []
+
+        new_notices[county] = county_new
+
+        archived = 0
+        try:
+            archived = sheets.archive_past_auctions(ws, county)
+            if archived:
+                print(f"  Moved {archived} past auctions to 'Past Auctions' tab")
+        except Exception as e:
+            print(f"  WARNING: archive failed for {county}: {e}")
+
+        sheets.sort_by_auction_date(ws)
+
+        try:
+            active_data = ws.get_all_values()
+            total_active = max(0, len([r for r in active_data[FIRST_DATA_ROW-1:] if any(c.strip() for c in r)]))
+        except Exception:
+            total_active = 0
+
+        county_duration = f"{time.time() - county_start:.1f}s"
+        run_stats[county] = {
+            "total_active": total_active,
+            "new_count": len(county_new),
+            "archived": archived,
+            "errors": 1 if any(county in e for e in errors) else 0,
+            "pages": min(len(listings) // 10 + 1, MAX_PAGES) if listings else 0,
+            "status": "OK" if not any(county in e for e in errors) else "ERROR",
+            "duration": county_duration,
+            "error_msg": "",
+        }
+
+        time.sleep(2)
+
+    print("\n--- Updating Summary ---")
+    sheets.update_summary({c: len(new_notices.get(c, [])) for c in COUNTIES}, run_stats)
+
+    sheets.update_run_log(run_stats)
+
+    sheets.update_resource_sheet()
+
+    total_new = sum(len(v) for v in new_notices.values())
+    total_archived = sum(run_stats.get(c, {}).get("archived", 0) for c in COUNTIES)
+    print(f"\n{'=' * 60}")
+    print(f"COMPLETE — {total_new} new | {total_archived} archived")
+    for county in COUNTIES:
+        s = run_stats.get(county, {})
+        print(f"  {county}: +{s.get('new_count',0)} new | -{s.get('archived',0)} archived | {s.get('total_active',0)} active")
+    if errors:
+        print(f"\nErrors ({len(errors)}):")
+        for e in errors:
+            print(f"  - {e}")
+    print(f"{'=' * 60}")
+
+    send_email_report(new_notices, errors, run_stats)
+
+    if errors and total_new == 0:
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    run_pipeline()
