@@ -293,7 +293,7 @@ class MSNoticesScraper:
                     snippet = sibling_tr.get_text(separator=" ", strip=True)
                     # Remove "click 'view' to open the full text." suffix
                     snippet = re.sub(
-                        r"\s*click\s*'view'\s+to\s+open\s+the\s+full\s+text\.\s*",
+                        r"\s*click\s+'view'\s+to\s+open\s+the\s+full\s+text\.\s*",
                         "", snippet, flags=re.IGNORECASE
                     ).strip()
 
@@ -301,7 +301,7 @@ class MSNoticesScraper:
             borrower = ""
             if snippet:
                 borrow_match = re.search(
-                    r"(?:executed|given|made)\s+(?:a\s+certin\s+)?(?:deed of trust|Deed of Trust)"
+                    r"(?:executed|given|made)\s+(?:a\s+certain\s+)?(?:deed of trust|Deed of Trust)"
                     r"|(?:WHEREAS,?\s+on\s+\w+\s+\d{1,2},?\s+\d{4},?\s+)(.+?)(?:,?\s+executed)",
                     snippet, re.IGNORECASE | re.DOTALL
                 )
@@ -449,11 +449,132 @@ class SheetHandler:
             print(f"    ERROR writing row {next_row}: {e}")
             return False
 
+    def batch_append_notices(self, ws, notices, county):
+        """Batch-write all notices for a county in a single API call.
+        Avoids Google Sheets 60 writes/min rate limit."""
+        if not notices:
+            return []
+
+        start_row = self.find_next_empty_row(ws)
+        today = date.today().strftime("%m/%d/%Y")
+        all_rows = []
+
+        for notice in notices:
+            row_data = [""] * 19
+            row_data[COL["scrape_date"] - 1] = today
+            row_data[COL["borrower"] - 1] = notice.get("borrower", "")
+            row_data[COL["county"] - 1] = county
+            row_data[COL["dot_date"] - 1] = notice.get("dot_date", "")
+            row_data[COL["filing_info"] - 1] = notice.get("filing_info", "")
+            row_data[COL["attorney"] - 1] = notice.get("attorney", "")
+            row_data[COL["auction_date"] - 1] = notice.get("auction_date", "")
+            row_data[COL["auction_time"] - 1] = notice.get("auction_time", "")
+            row_data[COL["auction_location"] - 1] = notice.get("auction_location", "")
+            row_data[COL["legal_desc"] - 1] = notice.get("legal_desc", "")
+            row_data[COL["pub_dates"] - 1] = notice.get("pub_dates", "")
+            row_data[COL["notice_url"] - 1] = notice.get("url", "")
+            all_rows.append(row_data)
+
+        end_row = start_row + len(all_rows) - 1
+        range_name = f"A{start_row}:S{end_row}"
+
+        try:
+            ws.update(values=all_rows, range_name=range_name, value_input_option="USER_ENTERED")
+            print(f"  Batch wrote {len(all_rows)} rows ({range_name})")
+            return notices  # all succeeded
+        except Exception as e:
+            print(f"    ERROR batch writing {range_name}: {e}")
+            return []
+
+    def get_or_create_past_auctions_tab(self):
+        """Get or create the 'Past Auctions' tab."""
+        try:
+            return self.spreadsheet.worksheet("Past Auctions")
+        except gspread.exceptions.WorksheetNotFound:
+            print("  Creating 'Past Auctions' tab...")
+            ws = self.spreadsheet.add_worksheet(title="Past Auctions", rows=1000, cols=19)
+            # Write header row matching county tab columns
+            headers = [
+                "Scrape Date", "Borrower", "County", "Phone", "Alt Phone",
+                "Current Address", "Mailing Address", "Parcel ID", "Property Address",
+                "DOT Date", "Filing Info", "Attorney", "Auction Date", "Auction Time",
+                "Auction Location", "Legal Desc", "Pub Dates", "Notice URL", "Assessed Value"
+            ]
+            ws.update(values=[headers], range_name="A1:S1", value_input_option="USER_ENTERED")
+            return ws
+
+    def archive_past_auctions(self, county_ws, county):
+        """Move rows with past auction dates from county tab to Past Auctions tab.
+        Rows are REMOVED from the county tab and APPENDED to Past Auctions."""
+        today = date.today()
+        try:
+            all_data = county_ws.get_all_values()
+        except Exception as e:
+            print(f"  ERROR reading {county} tab for archival: {e}")
+            return 0
+
+        if len(all_data) <= FIRST_DATA_ROW - 1:
+            return 0  # no data rows
+
+        rows_to_archive = []
+        row_indices_to_delete = []  # 1-indexed sheet rows
+
+        for i, row in enumerate(all_data):
+            sheet_row = i + 1  # 1-indexed
+            if sheet_row < FIRST_DATA_ROW:
+                continue  # skip header rows
+            if not any(cell.strip() for cell in row):
+                continue  # skip empty rows
+
+            auction_date_str = row[COL["auction_date"] - 1].strip() if len(row) >= COL["auction_date"] else ""
+            if not auction_date_str:
+                continue  # no auction date -- skip
+
+            # Try parsing auction date in multiple formats
+            auction_dt = None
+            for fmt in ("%m/%d/%Y", "%B %d, %Y", "%b %d, %Y", "%Y-%m-%d", "%m-%d-%Y"):
+                try:
+                    auction_dt = datetime.strptime(auction_date_str, fmt).date()
+                    break
+                except ValueError:
+                    continue
+
+            if auction_dt and auction_dt < today:
+                rows_to_archive.append(row[:19])  # cap at 19 cols
+                row_indices_to_delete.append(sheet_row)
+
+        if not rows_to_archive:
+            return 0
+
+        # Write archived rows to Past Auctions tab
+        past_ws = self.get_or_create_past_auctions_tab()
+        past_all = past_ws.get_all_values()
+        past_next_row = len(past_all) + 1
+        if past_next_row < 2:
+            past_next_row = 2  # row 1 is header
+
+        end_row = past_next_row + len(rows_to_archive) - 1
+        range_name = f"A{past_next_row}:S{end_row}"
+        try:
+            past_ws.update(values=rows_to_archive, range_name=range_name, value_input_option="USER_ENTERED")
+            print(f"  Archived {len(rows_to_archive)} past auctions from {county}")
+        except Exception as e:
+            print(f"  ERROR writing to Past Auctions: {e}")
+            return 0
+
+        # Delete rows from county tab (reverse order to preserve indices)
+        for row_idx in reversed(row_indices_to_delete):
+            try:
+                county_ws.delete_rows(row_idx)
+            except Exception as e:
+                print(f"  WARNING: Could not delete row {row_idx} from {county}: {e}")
+
+        return len(rows_to_archive)
+
     def update_summary(self, county_counts):
         """Update the Summary tab with latest counts."""
         try:
             summary = self.spreadsheet.worksheet("Summary")
-            # Update is county-specific -- adjust cell references to match your layout
             print("  Summary tab update -- adjust cell references in code to match your layout")
         except Exception as e:
             print(f"  WARNING: Could not update Summary tab: {e}")
@@ -579,23 +700,28 @@ def run_pipeline():
             new_notices[county] = []
             continue
 
-        # Write new notices to sheet
+        # Write new notices to sheet in a single batch API call
+        # (avoids Google Sheets 60 writes/min rate limit)
         # Note: Detail pages are CAPTCHA-protected as of May 2026.
         # Borrower + DOT date are parsed from search result snippets.
         # Detail URL is stored so notices can be reviewed manually.
-        county_new = []
         for i, listing in enumerate(new_listings):
             print(f"    [{i+1}/{len(new_listings)}] {listing.get('borrower', 'Unknown')[:50]}")
 
-            # Write to sheet (data already extracted from search results)
-            success = sheets.append_notice(ws, listing, county)
-            if success:
-                county_new.append(listing)
-            else:
-                errors.append(f"{county}: failed to write {listing['id']}")
+        county_new = sheets.batch_append_notices(ws, new_listings, county)
+        if not county_new and new_listings:
+            errors.append(f"{county}: batch write failed for {len(new_listings)} notices")
 
         new_notices[county] = county_new
         print(f"  Added {len(county_new)} new entries to sheet")
+
+        # Archive past auctions (move to "Past Auctions" tab)
+        try:
+            archived = sheets.archive_past_auctions(ws, county)
+            if archived:
+                print(f"  Moved {archived} past auctions to 'Past Auctions' tab")
+        except Exception as e:
+            print(f"  WARNING: archive_past_auctions failed for {county}: {e}")
 
         # Respect rate limits between counties
         time.sleep(2)
