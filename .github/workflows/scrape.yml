@@ -30,7 +30,7 @@ jobs:
       - name: Install dependencies
         run: |
           pip install -r requirements.txt || true
-          pip install playwright requests gspread google-oauth2-service-account
+          pip install playwright requests gspread
 
       - name: Install Playwright Chromium Browser
         run: |
