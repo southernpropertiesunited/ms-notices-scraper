@@ -1,24 +1,13 @@
 #!/usr/bin/env python3
 """
-SPU MS Public Notices Scraper
-=============================
-Scrapes foreclosure notices from mspublicnotices.org for target MS counties.
-Parses borrower info, DOT dates, attorneys, auction details.
-Pushes new entries to Google Sheet, skips duplicates.
+SPU MS Public Notices AI Command Center — Scraper
+==================================================
+Scrapes foreclosure notices from mspublicnotices.org for 7 MS counties.
+Parses ALL available data from search result snippets (detail pages are
+CAPTCHA-protected). Pushes to Google Sheet with dedup, sorting, archival,
+run logging, and email notifications.
 
-Runs via GitHub Actions on Mon/Wed/Fri at 6AM CT -- zero AI charges.
-
-SETUP (one-time):
-1. Create a Google Cloud project at https://console.cloud.google.com
-2. Enable Google Sheets API + Google Drive API
-3. Create a Service Account, download JSON key
-4. Share your Google Sheet with the service account email (Editor access)
-5. In your GitHub repo Settings > Secrets, add:
-   - GOOGLE_SERVICE_ACCOUNT_JSON  (paste entire JSON key contents)
-   - NOTIFY_EMAIL                 (paul@southernpropertiesunited.com)
-   - SMTP_USER                    (Gmail address for sending email)
-   - SMTP_PASSWORD                (app password for sending email)
-6. Push this repo and the workflow runs automatically.
+Runs via GitHub Actions Mon/Wed/Fri at 6 AM CT.
 """
 
 import requests
@@ -32,7 +21,7 @@ import sys
 import time
 import smtplib
 import traceback
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
@@ -45,49 +34,221 @@ SHEET_ID = "1cgGpocIQBdP_39tuI3Pqy4xJud7vZ2yCrHr4_PBH0Ro"
 BASE_URL = "https://www.mspublicnotices.org"
 SEARCH_URL = f"{BASE_URL}/Search.aspx"
 
-# County checkbox indices on the redesigned mspublicnotices.org form
-# Each county has a checkbox: ctl00$ContentPlaceHolder1$as1$lstCounty$N
 COUNTY_INDICES = {
     "George": 19, "Hancock": 22, "Harrison": 23,
     "Hinds": 24, "Jackson": 29, "Rankin": 60, "Stone": 65,
 }
 
-# Google Sheets scopes
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
 ]
 
-# Column layout in each county tab (1-indexed for gspread)
+# Column layout — 19 columns A-S
 COL = {
     "scrape_date": 1,       # A
     "borrower": 2,          # B
     "county": 3,            # C
     "phone": 4,             # D
     "alt_phone": 5,         # E
-    "current_address": 6,   # F
-    "mailing_address": 7,   # G
+    "mailing_address": 6,   # F
+    "property_address": 7,  # G
     "parcel_id": 8,         # H
-    "property_address": 9,  # I
-    "dot_date": 10,         # J
-    "filing_info": 11,      # K
-    "attorney": 12,         # L
-    "auction_date": 13,     # M
-    "auction_time": 14,     # N
-    "auction_location": 15, # O
-    "legal_desc": 16,       # P
-    "pub_dates": 17,        # Q
-    "notice_url": 18,       # R
+    "dot_date": 9,          # I
+    "filing_info": 10,      # J
+    "attorney": 11,         # K
+    "auction_date": 12,     # L
+    "auction_time": 13,     # M
+    "auction_location": 14, # N
+    "legal_desc": 15,       # O
+    "pub_dates": 16,        # P
+    "notice_url": 17,       # Q
+    "notice_id": 18,        # R
     "assessed_value": 19,   # S
 }
 
-FIRST_DATA_ROW = 7  # Row 7 is first data row (rows 1-6 are headers)
+HEADERS = [
+    "Scrape Date", "Borrower", "County", "Phone", "Alt Phone",
+    "Mailing Address", "Property Address", "Parcel ID", "DOT Date",
+    "Filing Info", "Attorney/Trustee", "Auction Date", "Auction Time",
+    "Auction Location", "Legal Description", "Publication Dates",
+    "Notice URL", "Notice ID", "Assessed Value"
+]
 
-# Rate limit: seconds between HTTP requests
+FIRST_DATA_ROW = 7
 RATE_LIMIT = 1.5
-
-# Maximum pages to paginate per county (prevents runaway loops)
 MAX_PAGES = 20
+
+# ============================================================
+# SNIPPET PARSER — Extracts everything possible from search snippets
+# ============================================================
+
+def parse_snippet(snippet, notice_id=""):
+    """
+    Aggressively parse a foreclosure notice snippet to extract all
+    available fields. MS foreclosure notices follow a standard format:
+
+    'WHEREAS, on [DOT_DATE], [BORROWER], executed a Deed of Trust to
+    [TRUSTEE]... recorded in [BOOK/INSTRUMENT]... [COUNTY] County...
+    I, [ATTORNEY], the duly appointed Substitute Trustee... will offer
+    for sale... on [AUCTION_DATE], [at/between] [AUCTION_TIME]...
+    at [AUCTION_LOCATION]...'
+    """
+    data = {
+        "borrower": "",
+        "dot_date": "",
+        "filing_info": "",
+        "attorney": "",
+        "auction_date": "",
+        "auction_time": "",
+        "auction_location": "",
+        "legal_desc": "",
+        "property_address": "",
+    }
+
+    if not snippet:
+        return data
+
+    s = snippet
+
+    # --- BORROWER ---
+    # Pattern: "on [date], [BORROWER], executed a Deed of Trust"
+    # Also: "on [date], [BORROWER] executed" (no comma before executed)
+    borrow_patterns = [
+        r"(?:WHEREAS,?\s+)?on\s+\w+\s+\d{1,2},?\s+\d{4},?\s+(.+?),?\s+executed\s+(?:a\s+)?(?:certain\s+)?(?:deed\s+of\s+trust|Deed\s+of\s+Trust)",
+        r"(?:WHEREAS,?\s+)?on\s+\w+\s+\d{1,2},?\s+\d{4},?\s+(.+?)\s+executed\s+(?:a\s+)?(?:deed\s+of\s+trust|Deed\s+of\s+Trust)",
+        r"(?:WHEREAS,?\s+)?on\s+\w+\s+\d{1,2},?\s+\d{4},?\s+(.+?),?\s+(?:did\s+)?(?:execute|made\s+and\s+deliver)",
+        r"(?:that\s+)?(\S.+?)\s+executed\s+(?:a\s+)?(?:certain\s+)?deed\s+of\s+trust",
+    ]
+    for pat in borrow_patterns:
+        m = re.search(pat, s, re.IGNORECASE | re.DOTALL)
+        if m and m.group(1):
+            borrower = m.group(1).strip()
+            borrower = re.sub(r"\s+", " ", borrower).strip(" ,;")
+            # Cap at 80 chars to avoid grabbing too much
+            if len(borrower) <= 80:
+                data["borrower"] = borrower
+                break
+
+    # --- DOT DATE ---
+    dot_patterns = [
+        r"WHEREAS,?\s+on\s+(\w+\s+\d{1,2},?\s+\d{4})",
+        r"on\s+(?:the\s+)?(\d{1,2}(?:st|nd|rd|th)?\s+day\s+of\s+\w+,?\s+\d{4})",
+        r"on\s+(\w+\s+\d{1,2},?\s+\d{4}),?\s+\w",
+    ]
+    for pat in dot_patterns:
+        m = re.search(pat, s, re.IGNORECASE)
+        if m:
+            data["dot_date"] = m.group(1).strip()
+            break
+
+    # --- FILING INFO ---
+    # "recorded in Book XXX, Page YYY" or "Instrument No. XXXX"
+    filing_patterns = [
+        r"recorded\s+in\s+(Book\s+\d+[\w\s,]+?Page\s+\d+)",
+        r"recorded\s+(?:at\s+)?(?:in\s+)?(Instrument\s+(?:No\.?\s*)?\d[\d\-]+)",
+        r"(?:Book|Bk\.?)\s+(\d+)\s*,?\s*(?:Page|Pg\.?|at\s+Page)\s+(\d+)",
+        r"(Instrument\s+(?:#|No\.?|Number)?\s*\d[\d\-]+)",
+    ]
+    for pat in filing_patterns:
+        m = re.search(pat, s, re.IGNORECASE)
+        if m:
+            if m.lastindex and m.lastindex >= 2:
+                data["filing_info"] = f"Book {m.group(1)}, Page {m.group(2)}"
+            else:
+                data["filing_info"] = m.group(1).strip() if m.group(1) else m.group(0).strip()
+            break
+
+    # --- ATTORNEY / SUBSTITUTE TRUSTEE ---
+    atty_patterns = [
+        r"(?:I,|undersigned)\s+([A-Z][A-Za-z\s\.,']+?),?\s+(?:the\s+)?(?:duly\s+)?(?:appointed\s+)?Substitute\s+Trustee",
+        r"(?:appointed|named)\s+([A-Z][A-Za-z\s\.,']+?)\s+as\s+(?:the\s+)?Substitute\s+Trustee",
+        r"Substitute\s+Trustee[\s:]+([A-Z][A-Za-z\s\.,']+?)(?:\s*,|\s+will|\s+does)",
+        r"(?:TRUSTEE|Trustee)[\s:,]+([A-Z][A-Za-z\s\.,']{5,50}?)(?:\s*,|\s+\d|\s+will)",
+    ]
+    for pat in atty_patterns:
+        m = re.search(pat, s, re.DOTALL)
+        if m:
+            atty = m.group(1).strip().strip(",. ")
+            atty = re.sub(r"\s+", " ", atty)
+            if len(atty) <= 60 and len(atty) >= 3:
+                data["attorney"] = atty
+                break
+
+    # --- AUCTION DATE ---
+    # "will sell...on [DATE]" or "sale will be held on [DATE]"
+    # Also: "on the Xth day of Month, Year"
+    auction_patterns = [
+        r"(?:sell|sale|sold)\s+(?:at\s+public\s+(?:outcry|auction|sale)\s+)?.*?on\s+(?:the\s+)?(\w+\s+\d{1,2},?\s+\d{4})",
+        r"(?:sell|sale|sold)\s+.*?on\s+(?:the\s+)?(\d{1,2}(?:st|nd|rd|th)?\s+day\s+of\s+\w+,?\s+\d{4})",
+        r"(?:sale\s+(?:date|will\s+be\s+held))[\s:]+(\w+\s+\d{1,2},?\s+\d{4})",
+        r"(?:on|dated?)\s+(\w+\s+\d{1,2},?\s+\d{4})\s*,?\s*(?:at|between)\s+\d{1,2}:\d{2}",
+    ]
+    for pat in auction_patterns:
+        m = re.search(pat, s, re.IGNORECASE | re.DOTALL)
+        if m:
+            auction_str = m.group(1).strip()
+            # Make sure this isn't the DOT date (check it's a different date)
+            if auction_str != data["dot_date"]:
+                data["auction_date"] = auction_str
+                break
+
+    # If we found an auction date in "Xth day of Month, Year" format, normalize it
+    if data["auction_date"]:
+        day_of_match = re.match(r"(\d{1,2})(?:st|nd|rd|th)?\s+day\s+of\s+(\w+),?\s+(\d{4})", data["auction_date"])
+        if day_of_match:
+            data["auction_date"] = f"{day_of_match.group(2)} {day_of_match.group(1)}, {day_of_match.group(3)}"
+
+    # --- AUCTION TIME ---
+    time_patterns = [
+        r"(?:at|between)\s+(\d{1,2}:\d{2}\s*(?:AM|PM|A\.M\.|P\.M\.|a\.m\.|p\.m\.|o'clock|noon))",
+        r"(?:at|between)\s+(\d{1,2}:\d{2})\s+(?:o'clock\s+)?(?:in\s+the\s+)?(morning|afternoon|noon)",
+        r"(?:at\s+)?(\d{1,2}:\d{2})\s*(?:AM|PM|A\.M\.|P\.M\.)",
+        r"(?:at\s+)?(\d{1,2}\s*(?:AM|PM|A\.M\.|P\.M\.))\b",
+    ]
+    for pat in time_patterns:
+        m = re.search(pat, s, re.IGNORECASE)
+        if m:
+            time_str = m.group(1).strip()
+            if m.lastindex >= 2 and m.group(2):
+                time_str += " " + m.group(2)
+            data["auction_time"] = time_str.upper().replace(".", "")
+            break
+
+    # --- AUCTION LOCATION ---
+    loc_patterns = [
+        r"(?:front|south|north|east|west|main)\s+(?:door|steps?|entrance)\s+of\s+(?:the\s+)?(.+?)(?:County\s+Courthouse)(?:\s+(?:in|at|,)\s+([A-Za-z\s]+),?\s*(?:Mississippi|MS))?",
+        r"(?:at\s+the\s+)(.+?County\s+Courthouse.+?)(?:\s+on\s+|\s+at\s+\d|\s*,\s*(?:I|the|said|being))",
+        r"(?:at\s+the\s+)([\w\s]+?Courthouse[\w\s,]*?(?:Mississippi|MS))",
+        r"(?:at\s+the\s+)([\w\s]+?County\s+Courthouse)",
+    ]
+    for pat in loc_patterns:
+        m = re.search(pat, s, re.IGNORECASE | re.DOTALL)
+        if m:
+            loc = m.group(0).strip()
+            # Clean up — start from "at the" or the door description
+            loc = re.sub(r"^(?:at\s+the\s+)", "", loc, flags=re.IGNORECASE).strip()
+            loc = re.sub(r"\s+", " ", loc)
+            if len(loc) <= 120:
+                data["auction_location"] = loc
+                break
+
+    # --- PROPERTY / LEGAL DESCRIPTION ---
+    legal_patterns = [
+        r"(?:described\s+as|to[\s-]wit|property[\s:]+)([\s\S]{10,200}?)(?:\s+(?:WHEREAS|NOW|said\s+(?:deed|property|Deed)|I,\s+\w))",
+        r"(Lot\s+\d+[\w\s,]+?(?:Section|Block|Township|Range|Addition|Subdivision)[\w\s,\.]+?)(?:\s+(?:in|of|WHEREAS|NOW|said))",
+    ]
+    for pat in legal_patterns:
+        m = re.search(pat, s, re.IGNORECASE | re.DOTALL)
+        if m:
+            legal = m.group(1).strip().strip(",. ::")
+            legal = re.sub(r"\s+", " ", legal)
+            if len(legal) >= 10 and len(legal) <= 200:
+                data["legal_desc"] = legal
+                break
+
+    return data
+
 
 # ============================================================
 # SCRAPER
@@ -101,10 +262,9 @@ class MSNoticesScraper:
         self.session.headers.update({
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
         })
-        self.session_url = None  # Set after first GET (cookieless session)
+        self.session_url = None
 
     def get_hidden_fields(self, html):
-        """Extract ALL hidden input fields from page HTML."""
         soup = BeautifulSoup(html, "lxml")
         fields = {}
         for inp in soup.find_all("input", {"type": "hidden"}):
@@ -114,7 +274,6 @@ class MSNoticesScraper:
         return fields
 
     def _build_base_form(self, hidden, keywords="", search_type="AND"):
-        """Build the base form data dict with common fields."""
         form = dict(hidden)
         form["__LASTFOCUS"] = ""
         form["ctl00$ContentPlaceHolder1$as1$txtSearch"] = keywords
@@ -132,14 +291,6 @@ class MSNoticesScraper:
         return form
 
     def search_county(self, county):
-        """
-        Search for foreclosure notices in a given county.
-        Uses 3-step ASP.NET postback:
-          1) Select "Foreclosure" from Popular Searches dropdown
-          2) Check the county checkbox (triggers postback)
-          3) Click search button (btnGo)
-        Returns list of dicts: {id, title, url, county}
-        """
         results = []
         county_idx = COUNTY_INDICES.get(county)
         if county_idx is None:
@@ -148,11 +299,11 @@ class MSNoticesScraper:
 
         cb_name = f"ctl00$ContentPlaceHolder1$as1$lstCounty${county_idx}"
 
-        # --- Step 1: GET search page (follows redirect to session URL) ---
+        # Step 1: GET search page
         try:
             resp = self.session.get(SEARCH_URL, timeout=30)
             resp.raise_for_status()
-            self.session_url = resp.url  # e.g. /(S(xxx))/Search.aspx
+            self.session_url = resp.url
         except Exception as e:
             print(f"  ERROR fetching search page: {e}")
             return results
@@ -160,7 +311,7 @@ class MSNoticesScraper:
         hidden = self.get_hidden_fields(resp.text)
         time.sleep(RATE_LIMIT)
 
-        # --- Step 2: POST -- Select "Foreclosure" from Popular Searches ---
+        # Step 2: Select Foreclosure
         form = self._build_base_form(hidden)
         form["__EVENTTARGET"] = "ctl00$ContentPlaceHolder1$as1$ddlPopularSearches"
         form["__EVENTARGUMENT"] = ""
@@ -175,7 +326,7 @@ class MSNoticesScraper:
 
         time.sleep(RATE_LIMIT)
 
-        # --- Step 3: POST -- Check county checkbox (postback) ---
+        # Step 3: Check county checkbox
         hidden2 = self.get_hidden_fields(resp.text)
         form2 = self._build_base_form(hidden2, keywords="foreclosure real+estate", search_type="OR")
         form2["__EVENTTARGET"] = cb_name
@@ -192,7 +343,7 @@ class MSNoticesScraper:
 
         time.sleep(RATE_LIMIT)
 
-        # --- Step 4: POST -- Click search button (btnGo) ---
+        # Step 4: Click search
         hidden3 = self.get_hidden_fields(resp.text)
         form3 = self._build_base_form(hidden3, keywords="foreclosure real+estate", search_type="OR")
         form3["__EVENTTARGET"] = ""
@@ -208,7 +359,7 @@ class MSNoticesScraper:
             print(f"  ERROR searching {county}: {e}")
             return results
 
-        # --- Step 5: Parse results from all pages (capped at MAX_PAGES) ---
+        # Step 5: Parse all pages
         page_num = 1
         while page_num <= MAX_PAGES:
             print(f"    Page {page_num}...")
@@ -220,12 +371,10 @@ class MSNoticesScraper:
 
             results.extend(page_results)
 
-            # Check for next page button
             next_btn = self._find_next_page_btn(soup)
             if not next_btn:
                 break
 
-            # Navigate to next page
             time.sleep(RATE_LIMIT)
             hidden_pg = self.get_hidden_fields(resp.text)
             form_pg = self._build_base_form(hidden_pg, keywords="foreclosure real+estate", search_type="OR")
@@ -233,7 +382,7 @@ class MSNoticesScraper:
             form_pg["__EVENTARGUMENT"] = ""
             form_pg["ctl00$ContentPlaceHolder1$as1$ddlPopularSearches"] = "0"
             form_pg[cb_name] = "on"
-            form_pg[next_btn] = ""  # click next page image button
+            form_pg[next_btn] = ""
 
             try:
                 resp = self.session.post(self.session_url, data=form_pg, timeout=30)
@@ -250,15 +399,9 @@ class MSNoticesScraper:
         return results
 
     def _parse_search_results(self, soup, county):
-        """
-        Parse notice listings from search results GridView.
-        Extracts borrower name and DOT date from the snippet text
-        shown in the sibling TR row (detail pages are CAPTCHA-protected).
-        """
         results = []
         seen_ids = set()
 
-        # Find all hdnPKValue hidden fields -- each holds a notice ID
         pk_fields = soup.find_all("input", {"name": re.compile(r"hdnPKValue")})
         for pk in pk_fields:
             notice_id = pk.get("value", "").strip()
@@ -266,92 +409,60 @@ class MSNoticesScraper:
                 continue
             seen_ids.add(notice_id)
 
-            # Get the parent row -- has publication name, date, city, county
             row = pk.find_parent("tr")
             row_text = row.get_text(separator=" ", strip=True) if row else ""
+
+            # Extract county/city from row header
             county_match = re.search(r"County:\s*(\w+)", row_text)
             row_county = county_match.group(1) if county_match else ""
-            city_match = re.search(r"City:\s*([\w\s'-]+?)(?:\s+County:|\s*$)", row_text)
+            city_match = re.search(r"City:\s*([\w\s'-]+?)(?:\s+County:|\s+$)", row_text)
             city = city_match.group(1).strip() if city_match else ""
 
-            # Extract publication name and date from row
+            # Publication info
             pub_match = re.search(r"^(\S[\w\s&'-]+?)(?:\s*\||\s+\w+day,)", row_text)
             publication = pub_match.group(1).strip() if pub_match else ""
-            date_match = re.search(
-                r"(\w+day,\s+\w+\s+\d{1,2},\s+\d{4})", row_text
-            )
+            date_match = re.search(r"(\w+day,\s+\w+\s+\d{1,2},\s+\d{4})", row_text)
             pub_date = date_match.group(1).strip() if date_match else ""
 
+            # Build URL with notice ID (not session token)
             url = f"{BASE_URL}/Details.aspx?ID={notice_id}"
 
-            # Get the snippet text from the next sibling TR row
-            # (contains truncated notice text with borrower name + DOT date)
+            # Get FULL snippet text (no truncation during parsing)
             snippet = ""
             if row:
                 sibling_tr = row.find_next_sibling("tr")
                 if sibling_tr:
                     snippet = sibling_tr.get_text(separator=" ", strip=True)
-                    # Remove "click 'view' to open the full text." suffix
                     snippet = re.sub(
                         r"\s*click\s+'view'\s+to\s+open\s+the\s+full\s+text\.\s*",
                         "", snippet, flags=re.IGNORECASE
                     ).strip()
 
-            # Parse borrower from snippet WHEREAS clause
-            borrower = ""
-            if snippet:
-                borrow_match = re.search(
-                    r"(?:executed|given|made)\s+(?:a\s+certain\s+)?(?:deed of trust|Deed of Trust)"
-                    r"|(?:WHEREAS,?\s+on\s+\w+\s+\d{1,2},?\s+\d{4},?\s+)(.+?)(?:,?\s+executed)",
-                    snippet, re.IGNORECASE | re.DOTALL
-                )
-                if not borrow_match or not borrow_match.group(1):
-                    # Try alternate: "on [date], [NAME], executed"
-                    borrow_match2 = re.search(
-                        r"on\s+\w+\s+\d{1,2},?\s+\d{4},?\s+(.+?),?\s+executed",
-                        snippet, re.IGNORECASE
-                    )
-                    if borrow_match2:
-                        borrower = borrow_match2.group(1).strip()
-                else:
-                    borrower = borrow_match.group(1).strip() if borrow_match.group(1) else ""
-                # Clean up borrower name
-                borrower = re.sub(r"\s+", " ", borrower).strip(" ,")
-
-            # Parse DOT date from snippet
-            dot_date = ""
-            if snippet:
-                dot_match = re.search(
-                    r"WHEREAS,?\s+on\s+(\w+\s+\d{1,2},?\s+\d{4})",
-                    snippet, re.IGNORECASE
-                )
-                if dot_match:
-                    dot_date = dot_match.group(1).strip()
+            # Parse everything we can from the snippet
+            parsed = parse_snippet(snippet, notice_id)
 
             results.append({
                 "id": notice_id,
                 "url": url,
                 "county": row_county or county,
                 "city": city,
-                "borrower": borrower,
-                "dot_date": dot_date,
+                "borrower": parsed["borrower"],
+                "dot_date": parsed["dot_date"],
                 "publication": publication,
                 "pub_dates": pub_date,
                 "snippet": snippet[:500],
-                # Fields we can't get without detail page (CAPTCHA-protected):
-                "filing_info": "",
-                "attorney": "",
-                "auction_date": "",
-                "auction_time": "",
-                "auction_location": "",
-                "legal_desc": "",
+                "filing_info": parsed["filing_info"],
+                "attorney": parsed["attorney"],
+                "auction_date": parsed["auction_date"],
+                "auction_time": parsed["auction_time"],
+                "auction_location": parsed["auction_location"],
+                "legal_desc": parsed["legal_desc"],
+                "property_address": parsed.get("property_address", ""),
             })
 
         return results
 
     def _find_next_page_btn(self, soup):
-        """Find the name of the Next page image button, if it exists."""
-        # The GridView uses image buttons: btnNext (enabled when not on last page)
         btn = soup.find("input", {
             "name": re.compile(r"btnNext$"),
             "type": "image",
@@ -360,30 +471,21 @@ class MSNoticesScraper:
             return btn["name"]
         return None
 
-    # NOTE: get_notice_detail() removed -- detail pages are CAPTCHA-protected
-    # as of May 2026. All available data is now extracted from search result
-    # snippets in _parse_search_results().
 
 # ============================================================
 # GOOGLE SHEETS HANDLER
 # ============================================================
 
 class SheetHandler:
-    """Manages reading/writing to the Google Sheet."""
-
     def __init__(self):
         creds_json = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
         if not creds_json:
-            # Try loading from file (local dev)
             creds_path = os.path.join(os.path.dirname(__file__), "service_account.json")
             if os.path.exists(creds_path):
                 with open(creds_path) as f:
                     creds_json = f.read()
             else:
-                raise RuntimeError(
-                    "No Google credentials found. Set GOOGLE_SERVICE_ACCOUNT_JSON env var "
-                    "or place service_account.json in the script directory."
-                )
+                raise RuntimeError("No Google credentials. Set GOOGLE_SERVICE_ACCOUNT_JSON.")
 
         creds_info = json.loads(creds_json)
         creds = Credentials.from_service_account_info(creds_info, scopes=SCOPES)
@@ -391,67 +493,59 @@ class SheetHandler:
         self.spreadsheet = self.gc.open_by_key(SHEET_ID)
 
     def get_tab(self, county):
-        """Get worksheet for a county tab."""
         try:
             return self.spreadsheet.worksheet(county)
         except gspread.exceptions.WorksheetNotFound:
-            print(f"  WARNING: Tab '{county}' not found in sheet")
+            print(f"  WARNING: Tab '{county}' not found")
             return None
 
-    def get_existing_urls(self, ws):
-        """Get all existing notice URLs from column R to detect duplicates."""
+    # --- DEDUP by Notice ID (column R) ---
+    def get_existing_notice_ids(self, ws):
+        """Get all existing notice IDs from column R for dedup."""
         try:
-            url_col = ws.col_values(COL["notice_url"])
-            return set(u.strip() for u in url_col if u.strip())
+            id_col = ws.col_values(COL["notice_id"])
+            ids = set()
+            for val in id_col:
+                val = val.strip()
+                if val and val.lower() != "notice id":
+                    ids.add(val)
+            return ids
         except Exception:
             return set()
 
-    def get_existing_borrowers(self, ws):
-        """Get all existing borrower names from column B."""
+    def get_existing_ids_from_urls(self, ws):
+        """Fallback: extract notice IDs from URL column for backward compat."""
         try:
-            return ws.col_values(COL["borrower"])
+            url_col = ws.col_values(COL["notice_url"])
+            ids = set()
+            for url in url_col:
+                m = re.search(r"ID=(\d+)", url)
+                if m:
+                    ids.add(m.group(1))
+            return ids
         except Exception:
-            return []
+            return set()
+
+    def get_all_existing_ids(self, ws):
+        """Get notice IDs from both ID column and URL column."""
+        ids = self.get_existing_notice_ids(ws)
+        ids.update(self.get_existing_ids_from_urls(ws))
+        return ids
 
     def find_next_empty_row(self, ws):
-        """Find the first empty row after the header rows."""
-        borrowers = self.get_existing_borrowers(ws)
-        # Find last non-empty row in column B
-        last_row = FIRST_DATA_ROW
-        for i, val in enumerate(borrowers):
-            if val.strip():
-                last_row = i + 1  # 1-indexed
-        return max(last_row + 1, FIRST_DATA_ROW)
-
-    def append_notice(self, ws, notice, county):
-        """Append a single notice as a new row."""
-        next_row = self.find_next_empty_row(ws)
-        today = date.today().strftime("%m/%d/%Y")
-
-        row_data = [""] * 19  # A through S
-        row_data[COL["scrape_date"] - 1] = today
-        row_data[COL["borrower"] - 1] = notice.get("borrower", "")
-        row_data[COL["county"] - 1] = county
-        row_data[COL["dot_date"] - 1] = notice.get("dot_date", "")
-        row_data[COL["filing_info"] - 1] = notice.get("filing_info", "")
-        row_data[COL["attorney"] - 1] = notice.get("attorney", "")
-        row_data[COL["auction_date"] - 1] = notice.get("auction_date", "")
-        row_data[COL["auction_time"] - 1] = notice.get("auction_time", "")
-        row_data[COL["auction_location"] - 1] = notice.get("auction_location", "")
-        row_data[COL["legal_desc"] - 1] = notice.get("legal_desc", "")
-        row_data[COL["pub_dates"] - 1] = notice.get("pub_dates", "")
-        row_data[COL["notice_url"] - 1] = notice.get("url", "")
-
+        """Find first empty row after headers."""
         try:
-            ws.update(values=[row_data], range_name=f"A{next_row}:S{next_row}", value_input_option="USER_ENTERED")
-            return True
-        except Exception as e:
-            print(f"    ERROR writing row {next_row}: {e}")
-            return False
+            all_vals = ws.col_values(COL["borrower"])
+            last_row = FIRST_DATA_ROW
+            for i, val in enumerate(all_vals):
+                if val.strip():
+                    last_row = i + 1
+            return max(last_row + 1, FIRST_DATA_ROW)
+        except Exception:
+            return FIRST_DATA_ROW
 
     def batch_append_notices(self, ws, notices, county):
-        """Batch-write all notices for a county in a single API call.
-        Avoids Google Sheets 60 writes/min rate limit."""
+        """Batch-write all notices in a single API call."""
         if not notices:
             return []
 
@@ -464,6 +558,10 @@ class SheetHandler:
             row_data[COL["scrape_date"] - 1] = today
             row_data[COL["borrower"] - 1] = notice.get("borrower", "")
             row_data[COL["county"] - 1] = county
+            # phone, alt_phone left blank (skip trace Phase 2)
+            # mailing_address left blank (skip trace Phase 2)
+            row_data[COL["property_address"] - 1] = notice.get("property_address", "")
+            # parcel_id left blank (land records Phase 2)
             row_data[COL["dot_date"] - 1] = notice.get("dot_date", "")
             row_data[COL["filing_info"] - 1] = notice.get("filing_info", "")
             row_data[COL["attorney"] - 1] = notice.get("attorney", "")
@@ -473,6 +571,7 @@ class SheetHandler:
             row_data[COL["legal_desc"] - 1] = notice.get("legal_desc", "")
             row_data[COL["pub_dates"] - 1] = notice.get("pub_dates", "")
             row_data[COL["notice_url"] - 1] = notice.get("url", "")
+            row_data[COL["notice_id"] - 1] = notice.get("id", "")
             all_rows.append(row_data)
 
         end_row = start_row + len(all_rows) - 1
@@ -481,271 +580,168 @@ class SheetHandler:
         try:
             ws.update(values=all_rows, range_name=range_name, value_input_option="USER_ENTERED")
             print(f"  Batch wrote {len(all_rows)} rows ({range_name})")
-            return notices  # all succeeded
+            return notices
         except Exception as e:
             print(f"    ERROR batch writing {range_name}: {e}")
             return []
 
+    # --- SORTING by Auction Date (soonest first) ---
+    def sort_by_auction_date(self, ws):
+        """Sort all data rows by auction date ascending (soonest at top).
+        Rows with no auction date go to the bottom."""
+        try:
+            all_data = ws.get_all_values()
+        except Exception as e:
+            print(f"    ERROR reading for sort: {e}")
+            return
+
+        if len(all_data) <= FIRST_DATA_ROW:
+            return
+
+        header_rows = all_data[:FIRST_DATA_ROW - 1]
+        data_rows = [r for r in all_data[FIRST_DATA_ROW - 1:] if any(c.strip() for c in r)]
+
+        if not data_rows:
+            return
+
+        def parse_date_for_sort(row):
+            """Parse auction date for sorting. Returns (has_date, date_obj)."""
+            auction_str = row[COL["auction_date"] - 1].strip() if len(row) >= COL["auction_date"] else ""
+            if not auction_str:
+                return (1, datetime(2099, 12, 31))  # No date = bottom
+
+            for fmt in ("%B %d, %Y", "%B %d %Y", "%b %d, %Y", "%m/%d/%Y", "%Y-%m-%d", "%m-%d-%Y"):
+                try:
+                    dt = datetime.strptime(auction_str, fmt)
+                    return (0, dt)
+                except ValueError:
+                    continue
+            return (1, datetime(2099, 12, 31))
+
+        data_rows.sort(key=parse_date_for_sort)
+
+        # Pad rows to 19 cols
+        for i, row in enumerate(data_rows):
+            if len(row) < 19:
+                data_rows[i] = row + [""] * (19 - len(row))
+            elif len(row) > 19:
+                data_rows[i] = row[:19]
+
+        # Write back sorted data
+        start = FIRST_DATA_ROW
+        end = start + len(data_rows) - 1
+        try:
+            ws.update(values=data_rows, range_name=f"A{start}:S{end}", value_input_option="USER_ENTERED")
+            # Clear any leftover rows below
+            total_rows = ws.row_count
+            if end + 1 <= total_rows:
+                leftover = total_rows - end
+                if leftover > 0 and leftover <= 500:
+                    blank_rows = [[""] * 19] * leftover
+                    ws.update(values=blank_rows, range_name=f"A{end+1}:S{end+leftover}", value_input_option="USER_ENTERED")
+            print(f"    Sorted {len(data_rows)} rows by auction date")
+        except Exception as e:
+            print(f"    ERROR writing sorted data: {e}")
+
+    # --- DEDUP CLEANUP (removes duplicate notice IDs from existing data) ---
+    def dedup_existing_data(self, ws):
+        """Remove duplicate entries based on notice ID. Keeps the first occurrence."""
+        try:
+            all_data = ws.get_all_values()
+        except Exception as e:
+            print(f"    ERROR reading for dedup: {e}")
+            return 0
+
+        if len(all_data) <= FIRST_DATA_ROW:
+            return 0
+
+        seen_ids = set()
+        rows_to_keep = []
+        dupes_removed = 0
+
+        for i, row in enumerate(all_data):
+            if i < FIRST_DATA_ROW - 1:
+                continue  # skip headers
+
+            if not any(c.strip() for c in row):
+                continue
+
+            # Get notice ID from column R, or extract from URL in column Q
+            notice_id = row[COL["notice_id"] - 1].strip() if len(row) >= COL["notice_id"] else ""
+            if not notice_id:
+                url = row[COL["notice_url"] - 1].strip() if len(row) >= COL["notice_url"] else ""
+                m = re.search(r"ID=(\d+)", url)
+                if m:
+                    notice_id = m.group(1)
+
+            # Also check borrower + county as fallback composite key
+            borrower = row[COL["borrower"] - 1].strip() if len(row) >= COL["borrower"] else ""
+            county = row[COL["county"] - 1].strip() if len(row) >= COL["county"] else ""
+            composite_key = f"{borrower}|{county}".lower()
+
+            if notice_id and notice_id in seen_ids:
+                dupes_removed += 1
+                continue
+            if not notice_id and composite_key in seen_ids:
+                dupes_removed += 1
+                continue
+
+            if notice_id:
+                seen_ids.add(notice_id)
+            if composite_key:
+                seen_ids.add(composite_key)
+            rows_to_keep.append(row)
+
+        if dupes_removed == 0:
+            return 0
+
+        # Pad rows
+        for i, row in enumerate(rows_to_keep):
+            if len(row) < 19:
+                rows_to_keep[i] = row + [""] * (19 - len(row))
+
+        # Write deduped data back
+        start = FIRST_DATA_ROW
+        end = start + len(rows_to_keep) - 1
+        try:
+            ws.update(values=rows_to_keep, range_name=f"A{start}:S{end}", value_input_option="USER_ENTERED")
+            # Clear leftover rows
+            total_before = len(all_data)
+            if end + 1 <= total_before:
+                blank_count = total_before - end
+                if blank_count > 0 and blank_count <= 1000:
+                    blank_rows = [[""] * 19] * blank_count
+                    ws.update(values=blank_rows, range_name=f"A{end+1}:S{end+blank_count}", value_input_option="USER_ENTERED")
+            print(f"    Removed {dupes_removed} duplicates")
+        except Exception as e:
+            print(f"    ERROR writing deduped data: {e}")
+
+        return dupes_removed
+
+    # --- PAST AUCTIONS ARCHIVAL ---
     def get_or_create_past_auctions_tab(self):
-        """Get or create the 'Past Auctions' tab."""
         try:
             return self.spreadsheet.worksheet("Past Auctions")
         except gspread.exceptions.WorksheetNotFound:
             print("  Creating 'Past Auctions' tab...")
             ws = self.spreadsheet.add_worksheet(title="Past Auctions", rows=1000, cols=19)
-            # Write header row matching county tab columns
-            headers = [
-                "Scrape Date", "Borrower", "County", "Phone", "Alt Phone",
-                "Current Address", "Mailing Address", "Parcel ID", "Property Address",
-                "DOT Date", "Filing Info", "Attorney", "Auction Date", "Auction Time",
-                "Auction Location", "Legal Desc", "Pub Dates", "Notice URL", "Assessed Value"
-            ]
-            ws.update(values=[headers], range_name="A1:S1", value_input_option="USER_ENTERED")
+            ws.update(values=[HEADERS], range_name="A1:S1", value_input_option="USER_ENTERED")
             return ws
 
     def archive_past_auctions(self, county_ws, county):
-        """Move rows with past auction dates from county tab to Past Auctions tab.
-        Rows are REMOVED from the county tab and APPENDED to Past Auctions."""
+        """Move rows with past auction dates to Past Auctions tab."""
         today = date.today()
         try:
             all_data = county_ws.get_all_values()
         except Exception as e:
-            print(f"  ERROR reading {county} tab for archival: {e}")
+            print(f"  ERROR reading {county} for archival: {e}")
             return 0
 
         if len(all_data) <= FIRST_DATA_ROW - 1:
-            return 0  # no data rows
+            return 0
 
         rows_to_archive = []
-        row_indices_to_delete = []  # 1-indexed sheet rows
+        rows_to_keep = []
 
         for i, row in enumerate(all_data):
-            sheet_row = i + 1  # 1-indexed
-            if sheet_row < FIRST_DATA_ROW:
-                continue  # skip header rows
-            if not any(cell.strip() for cell in row):
-                continue  # skip empty rows
-
-            auction_date_str = row[COL["auction_date"] - 1].strip() if len(row) >= COL["auction_date"] else ""
-            if not auction_date_str:
-                continue  # no auction date -- skip
-
-            # Try parsing auction date in multiple formats
-            auction_dt = None
-            for fmt in ("%m/%d/%Y", "%B %d, %Y", "%b %d, %Y", "%Y-%m-%d", "%m-%d-%Y"):
-                try:
-                    auction_dt = datetime.strptime(auction_date_str, fmt).date()
-                    break
-                except ValueError:
-                    continue
-
-            if auction_dt and auction_dt < today:
-                rows_to_archive.append(row[:19])  # cap at 19 cols
-                row_indices_to_delete.append(sheet_row)
-
-        if not rows_to_archive:
-            return 0
-
-        # Write archived rows to Past Auctions tab
-        past_ws = self.get_or_create_past_auctions_tab()
-        past_all = past_ws.get_all_values()
-        past_next_row = len(past_all) + 1
-        if past_next_row < 2:
-            past_next_row = 2  # row 1 is header
-
-        end_row = past_next_row + len(rows_to_archive) - 1
-        range_name = f"A{past_next_row}:S{end_row}"
-        try:
-            past_ws.update(values=rows_to_archive, range_name=range_name, value_input_option="USER_ENTERED")
-            print(f"  Archived {len(rows_to_archive)} past auctions from {county}")
-        except Exception as e:
-            print(f"  ERROR writing to Past Auctions: {e}")
-            return 0
-
-        # Delete rows from county tab (reverse order to preserve indices)
-        for row_idx in reversed(row_indices_to_delete):
-            try:
-                county_ws.delete_rows(row_idx)
-            except Exception as e:
-                print(f"  WARNING: Could not delete row {row_idx} from {county}: {e}")
-
-        return len(rows_to_archive)
-
-    def update_summary(self, county_counts):
-        """Update the Summary tab with latest counts."""
-        try:
-            summary = self.spreadsheet.worksheet("Summary")
-            print("  Summary tab update -- adjust cell references in code to match your layout")
-        except Exception as e:
-            print(f"  WARNING: Could not update Summary tab: {e}")
-
-# ============================================================
-# EMAIL NOTIFICATION
-# ============================================================
-
-def send_email_report(new_notices, errors):
-    """Send email summary of scrape results."""
-    email_to = os.environ.get("NOTIFY_EMAIL", "")
-    smtp_user = os.environ.get("SMTP_USER", "")
-    smtp_pass = os.environ.get("SMTP_PASSWORD", "")
-    smtp_host = os.environ.get("SMTP_HOST", "smtp.gmail.com")
-    smtp_port = int(os.environ.get("SMTP_PORT", "587"))
-
-    if not all([email_to, smtp_user, smtp_pass]):
-        print("  Email credentials not configured -- skipping notification")
-        return
-
-    today = date.today().strftime("%m/%d/%Y")
-    total = sum(len(v) for v in new_notices.values())
-
-    subject = f"SPU Foreclosure Scrape -- {today} -- {total} new notices"
-
-    body_lines = [
-        f"MS Public Notices Scrape Report",
-        f"Date: {today}",
-        f"Total new notices found: {total}",
-        "",
-        "BY COUNTY:",
-        "=" * 40,
-    ]
-
-    for county in COUNTIES:
-        notices = new_notices.get(county, [])
-        body_lines.append(f"\n{county}: {len(notices)} new")
-        for n in notices:
-            body_lines.append(f"  - {n.get('borrower', 'Unknown')} | {n.get('url', '')}")
-
-    if errors:
-        body_lines.append("\n\nERRORS:")
-        body_lines.append("=" * 40)
-        for err in errors:
-            body_lines.append(f"  - {err}")
-
-    body_lines.append(f"\n\nSheet: https://docs.google.com/spreadsheets/d/{SHEET_ID}")
-
-    body = "\n".join(body_lines)
-
-    msg = MIMEMultipart()
-    msg["From"] = smtp_user
-    msg["To"] = email_to
-    msg["Subject"] = subject
-    msg.attach(MIMEText(body, "plain"))
-
-    try:
-        with smtplib.SMTP(smtp_host, smtp_port) as server:
-            server.starttls()
-            server.login(smtp_user, smtp_pass)
-            server.send_message(msg)
-            print(f"  Email sent to {email_to}")
-    except Exception as e:
-        print(f"  ERROR sending email: {e}")
-
-# ============================================================
-# MAIN PIPELINE
-# ============================================================
-
-def run_pipeline():
-    """Main entry point -- scrape all counties, update sheet, send report."""
-    print(f"{'=' * 60}")
-    print(f"SPU MS Public Notices Scraper")
-    print(f"Run: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"{'=' * 60}")
-
-    scraper = MSNoticesScraper()
-    errors = []
-
-    # Initialize Google Sheets
-    try:
-        sheets = SheetHandler()
-        print("Google Sheets connected.")
-    except Exception as e:
-        print(f"FATAL: Cannot connect to Google Sheets: {e}")
-        traceback.print_exc()
-        sys.exit(1)
-
-    new_notices = {}
-
-    for county in COUNTIES:
-        print(f"\n--- {county} County ---")
-
-        # Get the worksheet tab
-        ws = sheets.get_tab(county)
-        if not ws:
-            errors.append(f"{county}: tab not found")
-            continue
-
-        # Get existing URLs to skip duplicates
-        existing_urls = sheets.get_existing_urls(ws)
-        print(f"  Existing entries: {len(existing_urls)}")
-
-        # Scrape notices
-        try:
-            listings = scraper.search_county(county)
-        except Exception as e:
-            msg = f"{county}: search failed -- {e}"
-            print(f"  ERROR: {msg}")
-            errors.append(msg)
-            continue
-
-        print(f"  Found {len(listings)} total listings")
-
-        # Filter out duplicates
-        new_listings = [
-            l for l in listings
-            if l["url"] not in existing_urls
-        ]
-        print(f"  New (not in sheet): {len(new_listings)}")
-
-        if not new_listings:
-            new_notices[county] = []
-            continue
-
-        # Write new notices to sheet in a single batch API call
-        # (avoids Google Sheets 60 writes/min rate limit)
-        # Note: Detail pages are CAPTCHA-protected as of May 2026.
-        # Borrower + DOT date are parsed from search result snippets.
-        # Detail URL is stored so notices can be reviewed manually.
-        for i, listing in enumerate(new_listings):
-            print(f"    [{i+1}/{len(new_listings)}] {listing.get('borrower', 'Unknown')[:50]}")
-
-        county_new = sheets.batch_append_notices(ws, new_listings, county)
-        if not county_new and new_listings:
-            errors.append(f"{county}: batch write failed for {len(new_listings)} notices")
-
-        new_notices[county] = county_new
-        print(f"  Added {len(county_new)} new entries to sheet")
-
-        # Archive past auctions (move to "Past Auctions" tab)
-        try:
-            archived = sheets.archive_past_auctions(ws, county)
-            if archived:
-                print(f"  Moved {archived} past auctions to 'Past Auctions' tab")
-        except Exception as e:
-            print(f"  WARNING: archive_past_auctions failed for {county}: {e}")
-
-        # Respect rate limits between counties
-        time.sleep(2)
-
-    # Summary
-    total_new = sum(len(v) for v in new_notices.values())
-    print(f"\n{'=' * 60}")
-    print(f"COMPLETE -- {total_new} new notices added")
-    for county in COUNTIES:
-        count = len(new_notices.get(county, []))
-        if count:
-            print(f"  {county}: {count}")
-    if errors:
-        print(f"\nErrors ({len(errors)}):")
-        for e in errors:
-            print(f"  - {e}")
-    print(f"{'=' * 60}")
-
-    # Send email report
-    send_email_report(new_notices, errors)
-
-    # Exit with error code if there were critical failures
-    if errors and total_new == 0:
-        sys.exit(1)
-
-if __name__ == "__main__":
-    run_pipeline()
+     
