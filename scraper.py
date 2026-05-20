@@ -1,14 +1,15 @@
-With this **Nimble API credential** in hand, we can build a highly advanced public notice processing engine.
+#!/usr/bin/env python3
+"""
+SPU MS Public Notices AI Command Center — Ultimate Engine v4.0
+============================================================
+Scrapes foreclosure and probate notices from mspublicnotices.org for 6 MS counties.
+Integrates live BatchLeads API skip tracing to fill out phone, alt phone, and properties.
+Integrates Nimble API to extract dynamic values from Delta Computer Systems.
+Maintains absolute 19-column sheet layouts natively.
 
-Instead of treating your list of resources as separate tabs or bookmarks, we can use the **Nimble Web API** to turn the script into an automated orchestrator. When a notice is found on `mspublicnotices.org`, the script will programmatically use Nimble to query the **Delta Computer Systems** networks and **County Land Records** behind the scenes.
+Runs via GitHub Actions Mon/Wed/Fri at 6 AM CT.
 
----
-
-## The Unified Architecture Lifecycle
-
-By combining **Playwright**, **BatchLeads**, and **Nimble**, the data lifecycle for every single row in your Google Sheet now uses your resources sequentially:
-
-```
+The Unified Architecture Lifecycle:
 [1. Playwright Crawler] -> Scrapes Full Notice (Foreclosure / Probate)
         │
 [2. Regex Parsers]      -> Extracts Borrower/Deceased Name & County
@@ -20,113 +21,6 @@ By combining **Playwright**, **BatchLeads**, and **Nimble**, the data lifecycle 
         │
 [5. Sheet Dashboard]    -> Injects completely populated 19-Column row + 
                            Pre-filled manual backup search links
-
-```
-
----
-
-## Code Integration: The Nimble & Pre-Filled Link Modules
-
-We will add two new modules to your core script:
-
-1. **`query_nimble_property_data`**: Uses your new API token to execute a headless automated lookup on Mississippi Delta Computer Systems engines to extract **Parcel ID** and **Assessed Value**.
-2. **`generate_manual_search_links`**: Injects a functional backup directly into your Google Sheet rows, creating pre-formatted hyper-links for **TruePeopleSearch**, **PropStream**, and **County Registries** for edge cases that require human review.
-
-### 1. The Nimble Automation Handler
-
-```python
-NIMBLE_API_TOKEN = "14b5f72a91c74fec93fd3543f234ea4427229ee839f14d34857dcfa0251d4956"
-
-def query_nimble_property_data(name, county):
-    """
-    Uses Nimble Web API to bypass bot protections on Delta Computer Systems.
-    Searches by owner name and county to extract Assessed Value and Parcel ID.
-    """
-    if not name or name.lower() in ["unknown", ""]:
-        return {}
-
-    url = "https://api.nimbleway.com/v1/extract" # Nimble Parsing Parsing Engine Engine Endpoint
-    headers = {
-        "Authorization": f"Bearer {NIMBLE_API_TOKEN}",
-        "Content-Type": "application/json"
-    }
-    
-    # Target search routing for Mississippi's Delta Computer System landing page
-    payload = {
-        "url": "https://www.deltacomputersystems.com/search.html",
-        "format": "json",
-        "render_js": True,
-        "actions": [
-            {"action": "fill", "selector": "input[name*='search']", "value": name},
-            {"action": "click", "selector": "input[type='submit'], button:has-text('Search')"},
-            {"action": "wait", "value": 3000}
-        ]
-    }
-
-    try:
-        # Pass request through Nimble's automated anti-bot browser system
-        response = requests.post(url, json=payload, headers=headers, timeout=30)
-        if response.status_code == 200:
-            data = response.json()
-            # Parsing engine mapping out returned layout structures
-            text_corpus = data.get("content", "")
-            
-            parcel_match = re.search(r"(?:Parcel|PPIN)[:\s]*([\d\w-]+)", text_corpus, re.IGNORECASE)
-            value_match = re.search(r"(?:Assessed\s+Value|Total\s+Value)[:\s]*\$?([\d,]+)", text_corpus, re.IGNORECASE)
-            
-            return {
-                "parcel_id": parcel_match.group(1).strip() if parcel_match else "",
-                "assessed_value": f"${value_match.group(1).strip()}" if value_match else ""
-            }
-    except Exception as e:
-        print(f"      Nimble System Request Exception: {e}")
-    return {}
-
-```
-
-### 2. Pre-Filled Manual Search Link Generator
-
-```python
-def generate_manual_search_links(name, county, row_index):
-    """
-    Creates dynamic formulas for the sheet so you can manually review 
-    leads with one click using your secondary search resources.
-    """
-    clean_name = name.replace(" ", "+")
-    clean_county = county.replace(" ", "+")
-    
-    # TruePeopleSearch Deep-Link Formula
-    tps_link = f'=HYPERLINK("https://www.truepeoplesearch.com/results?name={clean_name}&citystatezip={clean_county}+County,+MS", "TruePeopleSearch Lookup")'
-    
-    # Dynamic Link based on County DuProcess registries
-    if county.lower() == "harrison":
-        land_link = f'=HYPERLINK("https://landrecords.co.harrison.ms.us/DuProcessWebInquiry/", "Harrison Land Records")'
-    elif county.lower() == "jackson":
-        land_link = f'=HYPERLINK("https://landrecords.co.jackson.ms.us/RealEstate/SearchEntry.aspx", "Jackson Land Records")'
-    else:
-        land_link = f'=HYPERLINK("https://www.deltacomputersystems.com/search.html", "Delta Computer Lookup")'
-        
-    return {"tps": tps_link, "land": land_link}
-
-```
-
----
-
-## The Master `scraper.py` File (Fully Loaded v4.0)
-
-This is the final, fully productionized version of your script. It uses **Playwright** to break the capture gate, **BatchLeads** to harvest contact traces, **Nimble** to scrape the county networks, and updates your **Summary, Run Log, and County tabs** natively while explicitly guarding against the Column T overspill error.
-
-```python
-#!/usr/bin/env python3
-"""
-SPU MS Public Notices AI Command Center — Ultimate Engine v4.0
-============================================================
-Scrapes foreclosure and probate notices from mspublicnotices.org for 6 MS counties.
-Integrates live BatchLeads API skip tracing to fill out phone, alt phone, and properties.
-Integrates Nimble API to extract dynamic values from Delta Computer Systems.
-Maintains absolute 19-column sheet layouts natively.
-
-Runs via GitHub Actions Mon/Wed/Fri at 6 AM CT.
 """
 
 import os
@@ -661,5 +555,3 @@ def run_pipeline():
 
 if __name__ == "__main__":
     run_pipeline()
-
-```
